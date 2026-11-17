@@ -1,0 +1,43 @@
+{
+  "name": "hoja",
+  "version": "0.3.0",
+  "description": "Trebol's TaskManage (acceptance questions + evidence-validated completion), its Swarm task-enforcement hooks and Hoja mode (automatic TaskManage \u2192 Hoja issue publication), plus the hosted Hoja API tools \u2014 ported 1:1 to Codex.",
+  "author": {
+    "name": "Hoja",
+    "url": "https://github.com/hoja-work"
+  },
+  "homepage": "https://github.com/hoja-work/hoja-codex-plugin",
+  "repository": "https://github.com/hoja-work/hoja-codex-plugin",
+  "license": "MIT",
+  "keywords": [
+    "hoja",
+    "tasks",
+    "taskmanage",
+    "hooks",
+    "project-management",
+    "codex"
+  ],
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Hoja",
+    "shortDescription": "Evidence-checked tasks, a task gate and Hoja issue sync",
+    "longDescription": "Gives Codex Trebol's TaskManage: every task carries acceptance questions and can only be completed with evidence that resolves to a real file or a real tool result from this session. A task-enforcement gate blocks mutating tools until a task is focused, and Hoja mode publishes each coarse task as a Hoja issue and keeps it current.",
+    "developerName": "Hoja",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/hoja-work/hoja-codex-plugin",
+    "defaultPrompt": [
+      "hoja:tasks",
+      "hoja:setup",
+      "Plan this change as a TaskManage task with acceptance questions, then do it."
+    ],
+    "brandColor": "#2F855A",
+    "composerIcon": "./assets/hoja.svg",
+    "logo": "./assets/hoja.svg"
+  }
+}

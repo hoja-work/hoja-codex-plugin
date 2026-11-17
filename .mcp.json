@@ -1,0 +1,49 @@
+{
+  "mcpServers": {
+    "hoja": {
+      "command": "node",
+      "args": [
+        "./dist/server.mjs"
+      ],
+      "cwd": ".",
+      "env": {
+        "HOJA_PLUGIN_HOST": "codex"
+      },
+      "env_vars": [
+        "HOJA_API_URL",
+        "HOJA_TOKEN",
+        "HOJA_PROJECT",
+        "HOJA_MCP_URL",
+        "HOJA_TASK_ENFORCEMENT",
+        "HOJA_PLUGIN_HEADLESS",
+        "HOJA_PLUGIN_DISABLE_HOJA",
+        "HOJA_AUTOGEN_SKILLS",
+        "HOJA_DEBUG_LOG",
+        "LINEAR_TOKEN",
+        "LINEAR_API_URL",
+        "HOJA_PLUGIN_DATA"
+      ],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 120
+    },
+    "hoja_api": {
+      "command": "node",
+      "args": [
+        "./dist/api-proxy.mjs"
+      ],
+      "cwd": ".",
+      "env": {
+        "HOJA_PLUGIN_HOST": "codex"
+      },
+      "env_vars": [
+        "HOJA_API_URL",
+        "HOJA_TOKEN",
+        "HOJA_MCP_URL",
+        "LINEAR_TOKEN",
+        "LINEAR_API_URL"
+      ],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 120
+    }
+  }
+}

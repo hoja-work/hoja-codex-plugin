@@ -1,0 +1,118 @@
+{
+  "description": "Trebol TaskManage + Swarm builtin hooks + Hoja mode. Every event is forwarded to the plugin's MCP server (one process per session), where the vendored Trebol code decides.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOJA_PLUGIN_HOST=codex node \"$PLUGIN_ROOT/dist/session-start.mjs\"",
+            "timeout": 30,
+            "additionalContextLimit": 6000
+          }
+        ]
+      },
+      {
+        "matcher": "clear|compact",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "SessionStart",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "source": "${source}"
+            },
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "UserPromptSubmit",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "prompt": "${prompt}",
+              "turn_id": "${turn_id}"
+            },
+            "timeout": 45
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "PreToolUse",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "tool_name": "${tool_name}",
+              "tool_input": "${tool_input}",
+              "tool_use_id": "${tool_use_id}"
+            },
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "PostToolUse",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "tool_name": "${tool_name}",
+              "tool_input": "${tool_input}",
+              "tool_use_id": "${tool_use_id}",
+              "tool_response": "${tool_response}"
+            },
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "Stop",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "stop_hook_active": "${stop_hook_active}",
+              "last_assistant_message": "${last_assistant_message}"
+            },
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
