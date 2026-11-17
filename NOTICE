@@ -1,0 +1,4 @@
+vendor/trebol/ contains files copied byte-for-byte from cloverinternational/trebol
+(https://github.com/cloverinternational/trebol) at the commit recorded in vendor/MANIFEST.json.
+They are unmodified; their provenance and SHA-256 hashes are listed in that manifest and checked by
+`npm run vendor:check`.

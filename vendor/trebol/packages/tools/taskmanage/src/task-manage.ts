@@ -1,0 +1,1187 @@
+export const CATEGORIES = ["researching", "planning", "acting", "verifying", "debugging", "documenting"] as const;
+export const PRIORITIES = ["low", "medium", "high"] as const;
+export const NOTE_TYPES = ["decision", "blocker", "learning", "milestone", "question", "observation", "other"] as const;
+export type Category = typeof CATEGORIES[number];
+export type Priority = typeof PRIORITIES[number];
+export type Status = "pending" | "in_progress" | "completed" | "deleted";
+export type NoteType = typeof NOTE_TYPES[number];
+export type Mode = "sequential" | "atomic";
+export type Ref = string | { ref: string; field?: "taskId" };
+export const MAX_TASK_QUESTIONS = 12;
+export const MAX_QUESTION_ID_LENGTH = 64;
+export const MAX_QUESTION_TEXT_LENGTH = 240;
+export const MAX_ANSWER_LENGTH = 2000;
+export const MAX_EVIDENCE_LENGTH = 512;
+export interface TaskQuestion { id: string; text: string }
+export interface TaskAnswer { question: string; answer: string; evidence: string }
+
+/**
+ * Swarm's TaskManage (internal/tools/ii/task_operation.go) renders the batch
+ * envelope from structs (declaration order: status, results[]{key, op, status,
+ * data}) but every task view (`data.task`, `data.tasks[]`) is a
+ * `map[string]any`, which encoding/json emits with bytewise-sorted keys at
+ * every level. Mirror that at the serialisation boundary so the model reads
+ * identical bytes from both runtimes.
+ */
+const sortKeysDeep = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (!value || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value as Record<string, unknown>).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) out[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+  return out;
+};
+export function goMapOrdered<T extends { results?: Array<{ data?: unknown }> }>(batch: T): T {
+  if (!Array.isArray(batch?.results)) return batch;
+  return { ...batch, results: batch.results.map(entry => {
+    const data = entry?.data as { task?: unknown; tasks?: unknown } | undefined;
+    if (!data || typeof data !== "object") return entry;
+    const next: Record<string, unknown> = { ...data };
+    if ("task" in data) next.task = sortKeysDeep(data.task);
+    if ("tasks" in data) next.tasks = sortKeysDeep(data.tasks);
+    return { ...entry, data: next };
+  }) };
+}
+
+export interface AuditEvent {
+  action: "created" | "updated" | "tool";
+  at: string;
+  actor?: string;
+  summary?: string;
+  tool?: string;
+  toolCallId?: string;
+  outcome?: "success" | "failure";
+}
+export interface TaskNote { text: string; type: NoteType; at: string }
+export interface Task {
+  id: string; subject: string; description?: string; activeForm?: string; category?: Category; priority: Priority;
+  metadata?: Record<string, unknown>; parentTaskId?: string; owner_id?: string; status: Status;
+  active?: boolean; dependsOn: string[]; notes: string[]; createdAt: string; updatedAt: string;
+  questions?: TaskQuestion[]; answers?: TaskAnswer[];
+  typed_notes?: TaskNote[]; audit_events?: AuditEvent[];
+  /** Swarm TodoManager per-owner sequence counter (shared_state.go AddTodo). */
+  sequence?: number;
+  /** SHA-256 of the create request (key included) that made this task; absent on tasks persisted before fingerprints. */
+  createFingerprint?: string;
+}
+export interface Operation {
+  key: string; op: "create" | "update" | "get" | "list"; taskId?: Ref; subject?: string;
+  description?: string; activeForm?: string; category?: Category; priority?: Priority; metadata?: Record<string, unknown>;
+  parentTaskId?: Ref; owner_id?: string; status?: Status; active?: boolean; limit?: number; offset?: number;
+  addBlocks?: Ref[]; addBlockedBy?: Ref[]; addNote?: string; noteType?: NoteType; include_audit?: boolean;
+  questions?: TaskQuestion[]; answers?: TaskAnswer[];
+}
+/** The batch description is a presentation label, not a task description. */
+export interface Params { operations: Operation[]; mode?: Mode; description?: string }
+export interface Failure { code: string; message: string; retryable: boolean }
+export interface Result { key: string; op: Operation["op"]; status: "succeeded" | "failed" | "skipped"; data?: unknown; error?: Failure }
+export interface Batch { status: "succeeded" | "partial" | "failed"; results: Result[] }
+export interface OperationEvent {
+  type: "pi-swarm-task-operation";
+  data: { mode: Mode; status: Batch["status"]; results: Result[]; at: string };
+}
+import { replayLatest, snapshot, type VersionedSnapshot } from "./persistence.js";
+import { ALLOWED, goNow, normalizeTaskManageParams, swarmValidateTaskManageParams } from "./swarm-validate.js";
+
+/**
+ * Per-op admissible fields, including the universal `key`/`op`, derived from
+ * the pre-gate's ALLOWED map so the schema, the pre-gate and the runtime
+ * validator can never disagree about which field belongs to which op.
+ */
+export const OPERATION_FIELDS: Record<string, string[]> =
+  Object.fromEntries(Object.entries(ALLOWED).map(([op, fields]) => [op, ["key", "op", ...fields]]));
+import { createHash, randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, statSync, realpathSync } from "node:fs";
+import { resolve as resolvePath, relative as relativePath, isAbsolute } from "node:path";
+
+export type JournalEntry = { type: "pi-swarm-task-state"; data: VersionedSnapshot<State> | State } | OperationEvent;
+export interface State { nextId: number; tasks: Task[]; keys: Record<string, string> }
+/** `evidenceRoots` is host-owned trusted configuration; task input can never set it. */
+export interface TaskManagerOptions { workspaceRoot?: string; evidenceRoots?: readonly string[]; canReadEvidence?: (path: string) => boolean; toolAliases?: Readonly<Record<string, readonly string[]>>; canonicalizeToolEvidence?: (reference: string) => string; sessionEvidenceHints?: () => string; resolveEvidence?: (reference: string) => boolean | string; resolveSessionEvidence?: (reference: string) => boolean }
+export interface TaskMetrics { mutations: number; reads: number; failures: number; lastRevision: number }
+
+const fail = (code: string, message: string, retryable = false): Failure => ({ code, message, retryable });
+
+/**
+ * Split a multi-file citation into individual references.
+ *
+ * Splitting naively on `;`/`,` would corrupt markdown headings, which legally
+ * contain both ("file.md#Results, caveats"). A separator therefore only ends a
+ * reference when what follows looks like the start of another one: a path-ish
+ * token containing `/` or a file extension, or a session tool reference
+ * (`tool:<Name>` / `tool:<Name>#<n>`). Anything else is left alone, so an
+ * unsplittable string is still validated as a single reference exactly as
+ * before.
+ */
+export function splitEvidence(evidence: string): string[] {
+  // Whitespace after the separator is optional: agents cite "a.md#X;b.md#Y"
+  // as often as "a.md#X; b.md#Y". The lookahead still keeps separators that
+  // are part of a heading ("a.md#Worklog, caveats") unsplit, because the text
+  // after them does not start another path-ish reference.
+  const parts = evidence.split(/[;,]\s*(?=tool:[^\s;,]*|[^\s;,]*(?:\/|\.[A-Za-z0-9]{1,8}(?:#|$)))/g)
+    .map(part => part.trim()).filter(Boolean);
+  return parts.length ? parts : [evidence.trim()];
+}
+const clone = <T>(x: T): T => structuredClone(x);
+const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === "object" && !Array.isArray(x);
+
+const taskRef = () => ({ oneOf: [{ type: "string" }, { type: "object", required: ["ref"], additionalProperties: false, properties: { ref: { type: "string" }, field: { type: "string", enum: ["taskId"] } } }] });
+
+/**
+ * Per-field JSON Schema fragments. `OPERATION_FIELDS` decides which of these
+ * each op may carry; nothing here restates admissibility.
+ */
+const FIELD_SCHEMA: Record<string, () => Record<string, unknown>> = {
+  key: () => ({ type: "string", description: "Correlation handle for this operation; unique within the batch. Later operations may target it as taskId:{\"ref\":\"<key>\"}." }),
+  op: () => ({ type: "string", enum: ["create", "update", "get", "list"] }),
+  taskId: taskRef,
+  parentTaskId: taskRef,
+  subject: () => ({ type: "string" }),
+  description: () => ({ type: "string" }),
+  activeForm: () => ({ type: "string" }),
+  category: () => ({ type: "string", enum: CATEGORIES }),
+  priority: () => ({ type: "string", enum: PRIORITIES }),
+  metadata: () => ({ type: "object" }),
+  owner_id: () => ({ type: "string" }),
+  status: () => ({ type: "string", enum: ["pending", "in_progress", "completed", "deleted"] }),
+  active: () => ({ type: "boolean" }),
+  limit: () => ({ type: "integer", minimum: 1, maximum: 500 }),
+  offset: () => ({ type: "integer", minimum: 0 }),
+  addBlocks: () => ({ type: "array", items: taskRef() }),
+  addBlockedBy: () => ({ type: "array", items: taskRef() }),
+  addNote: () => ({ type: "string" }),
+  noteType: () => ({ type: "string", enum: NOTE_TYPES }),
+  include_audit: () => ({ type: "boolean" }),
+  questions: () => ({ type: "array", minItems: 1, maxItems: MAX_TASK_QUESTIONS, items: { type: "object", required: ["id", "text"], additionalProperties: false, properties: { id: { type: "string", minLength: 1, maxLength: MAX_QUESTION_ID_LENGTH }, text: { type: "string", minLength: 1, maxLength: MAX_QUESTION_TEXT_LENGTH } } } }),
+  answers: () => ({ type: "array", minItems: 1, maxItems: MAX_TASK_QUESTIONS, items: { type: "object", required: ["question", "answer", "evidence"], additionalProperties: false, properties: { question: { type: "string", minLength: 1, maxLength: MAX_QUESTION_ID_LENGTH, description: "The id of the question being answered." }, answer: { type: "string", minLength: 1, maxLength: MAX_ANSWER_LENGTH }, evidence: { type: "string", minLength: 1, maxLength: MAX_EVIDENCE_LENGTH, description: "One or more references, separated by \";\" or \",\": file#Lx-Ly, file#L42, file.md#Heading, a bare file path, or tool:<ToolName> with optional #<n> (1-based) citing a live tool result from this session. Every reference must resolve." } } } }),
+};
+
+/** Fields each op requires, beyond the universal `key` and `op`. */
+const REQUIRED_FIELDS: Record<string, string[]> = {
+  // `questions` is enforced at runtime (see TaskManager.validate) and must be
+  // advertised here, or the model reads it as optional and every minimal
+  // create is rejected by a rule it was never shown.
+  create: ["subject", "questions"],
+  update: ["taskId"],
+  get: ["taskId"],
+  list: [],
+};
+
+const operationSchema = (op: string) => ({
+  type: "object",
+  required: ["key", "op", ...REQUIRED_FIELDS[op]],
+  additionalProperties: false,
+  properties: Object.fromEntries([
+    ["key", FIELD_SCHEMA.key()],
+    ["op", { const: op }],
+    ...OPERATION_FIELDS[op].filter(field => field !== "key" && field !== "op").map(field => [field, FIELD_SCHEMA[field]()]),
+  ]),
+});
+
+/**
+ * JSON schema is deliberately exported as plain JSON so the module works with
+ * every Pi release, and is generated from `OPERATION_FIELDS` so it cannot drift
+ * from the validators. The per-op `oneOf` is what stops the model emitting a
+ * field that a validator would then refuse.
+ */
+export const taskManageSchema = {
+  type: "object", required: ["operations"], additionalProperties: false,
+  properties: {
+    description: { type: "string", description: "Brief rendering label for this call; not stored on tasks." },
+    mode: { type: "string", enum: ["sequential", "atomic"] },
+    operations: { type: "array", minItems: 1, maxItems: 50, items: { oneOf: ["create", "update", "get", "list"].map(operationSchema) } },
+  },
+};
+
+type RenderTheme = {
+  fg?: (color: string, text: string) => string;
+  bold?: (text: string) => string;
+  dim?: (text: string) => string;
+};
+type RenderContext = { isError?: boolean; isPartial?: boolean; expanded?: boolean };
+type RenderComponent = {
+  render(width: number): string[];
+  invalidate(): void;
+};
+
+const style = (theme: RenderTheme, color: string, value: string) =>
+  theme.fg ? theme.fg(color, value) : value;
+const bold = (theme: RenderTheme, value: string) => theme.bold ? theme.bold(value) : value;
+const dim = (theme: RenderTheme, value: string) => theme.dim ? theme.dim(value) : value;
+const characterWidth = (character: string) => {
+  const point = character.codePointAt(0) ?? 0;
+  if (/\p{Mark}/u.test(character)) return 0;
+  return point >= 0x1100 && (
+    point <= 0x115f || point === 0x2329 || point === 0x232a ||
+    point >= 0x2e80 && point <= 0xa4cf ||
+    point >= 0xac00 && point <= 0xd7a3 ||
+    point >= 0xf900 && point <= 0xfaff ||
+    point >= 0xfe10 && point <= 0xfe6f ||
+    point >= 0xff00 && point <= 0xff60 ||
+    point >= 0x1f300 && point <= 0x1faff
+  ) ? 2 : 1;
+};
+export const taskDisplayWidth = (value: string) => Array.from(value).reduce((width, character) => width + characterWidth(character), 0);
+export const truncateTaskText = (value: string, width: number) => {
+  const limitWidth = Math.max(0, width);
+  if (taskDisplayWidth(value) <= limitWidth) return value;
+  const limit = Math.max(0, limitWidth - 1);
+  let used = 0;
+  let result = "";
+  for (const character of value) {
+    const next = characterWidth(character);
+    if (used + next > limit) break;
+    result += character;
+    used += next;
+  }
+  return `${result}${limitWidth > 0 ? "…" : ""}`;
+};
+const truncate = truncateTaskText;
+const component = (lines: string[] | ((width: number) => string[])): RenderComponent => ({
+  render: (width: number) => typeof lines === "function" ? lines(width) : lines,
+  invalidate: () => {},
+});
+
+type RenderTask = {
+  id?: string;
+  subject?: string;
+  content?: string;
+  status?: Status;
+  active?: boolean;
+  category?: Category;
+  parent_id?: string;
+  depends_on?: string[];
+  questions?: TaskQuestion[];
+  answers?: TaskAnswer[];
+};
+
+const questionSummary = (task: Pick<Task, "questions" | "answers">) => {
+  const questions = Array.isArray(task.questions) ? task.questions : [];
+  const ids = new Set<string>();
+  const valid = questions.filter(question => {
+    const ok = !!question && typeof question.id === "string" && question.id.trim() !== "" &&
+      typeof question.text === "string" && question.text.trim() !== "" && !ids.has(question.id);
+    if (ok) ids.add(question.id);
+    return ok;
+  });
+  const answers = Array.isArray(task.answers) ? task.answers : [];
+  const answered = new Set(answers.filter(answer => answer && typeof answer.question === "string" && ids.has(answer.question) &&
+    typeof answer.answer === "string" && answer.answer.trim() && typeof answer.evidence === "string" && answer.evidence.trim()).map(answer => answer.question));
+  return { total: valid.length, answered: answered.size, unresolved: valid.filter(question => !answered.has(question.id)), malformed: valid.length !== questions.length };
+};
+
+const renderQuestionLines = (task: Pick<Task, "questions" | "answers">, prefix: string, width: number, theme: RenderTheme): string[] => {
+  const summary = questionSummary(task);
+  if (!summary.total) return summary.malformed ? [truncate(`${prefix}? questions unavailable (malformed)`, width)] : [truncate(`${prefix}? acceptance questions missing — repair required`, width)];
+  const lines = [`${prefix}${summary.unresolved.length ? style(theme, "warning", "?") : style(theme, "success", "✓")} questions: ${summary.answered}/${summary.total} answered`];
+  for (const question of summary.unresolved.slice(0, 3)) lines.push(truncate(`${prefix}  ${question.id}: ${question.text}`, width));
+  if (summary.unresolved.length > 3) lines.push(truncate(`${prefix}  +${summary.unresolved.length - 3} more unresolved`, width));
+  return lines;
+};
+
+function taskRows(batch: Batch): { tasks: RenderTask[]; errors: string[] } {
+  const order: string[] = [];
+  const tasks = new Map<string, RenderTask>();
+  const errors: string[] = [];
+  let anonymous = 0;
+  for (const result of batch.results) {
+    if (result.error) {
+      errors.push(result.error.message || "Task update failed");
+      continue;
+    }
+    if (result.status !== "succeeded" || !isObj(result.data)) continue;
+    const data = result.data as { task?: RenderTask; tasks?: RenderTask[] };
+    const values = data.task ? [data.task] : Array.isArray(data.tasks) ? data.tasks : [];
+    for (const task of values) {
+      const key = task.id || `__anonymous_${anonymous++}`;
+      if (!tasks.has(key)) order.push(key);
+      tasks.set(key, task);
+    }
+  }
+  return { tasks: order.map(key => tasks.get(key)!), errors };
+}
+
+function renderTaskResult(task: RenderTask, first: boolean, width: number, theme: RenderTheme): string {
+  const prefix = first ? "    ⎿ " : "      ";
+  const rawIcon = task.status === "completed" ? "✓" : task.status === "in_progress" ? "◉" :
+    task.status === "pending" ? "○" : "?";
+  if (width <= taskDisplayWidth(prefix) + 2) return truncate(`${prefix}${rawIcon}`, width);
+  const icon = task.status === "completed" ? style(theme, "success", rawIcon) :
+    task.status === "in_progress" ? style(theme, "warning", rawIcon) : dim(theme, rawIcon);
+  const label = `${task.id ? `#${task.id} ` : ""}${task.content || task.subject || "Untitled task"}`;
+  const available = Math.max(0, width - taskDisplayWidth(prefix) - 2);
+  const text = truncate(label, available);
+  const rendered = task.status === "in_progress" ? bold(theme, text) :
+    task.status === "completed" ? dim(theme, text) : text;
+  return `${prefix}${icon} ${rendered}`;
+}
+
+export const taskManageRenderers = {
+  renderCall(_args: Params, theme: RenderTheme): RenderComponent {
+    return component([`${bold(theme, "TaskManage")} ${dim(theme, "Managing tasks…")}`]);
+  },
+
+  renderResult(result: any, options: RenderContext, theme: RenderTheme): RenderComponent {
+    if (options.isPartial)
+      return component([`    ${dim(theme, "⎿")} ${dim(theme, "Managing tasks…")}`]);
+    let batch: Batch | undefined;
+    // Pi may pass the structured tool details separately from content (and
+    // some renderer paths preserve only details). Prefer that canonical batch
+    // before parsing the model-facing text fallback.
+    const structured = result?.details?.batch ?? result?.details;
+    if (structured && Array.isArray(structured.results)) batch = structured as Batch;
+    const text = result?.content?.find((item: any) => item?.type === "text")?.text;
+    if (!batch && typeof text === "string") {
+      try { batch = JSON.parse(text); } catch { /* use fallback */ }
+    }
+    if (!batch || !Array.isArray(batch.results)) {
+      const message = options.isError ? "Task update failed" : "Task state unavailable";
+      return component([`    ${dim(theme, "⎿")} ${options.isError ? style(theme, "error", message) : dim(theme, message)}`]);
+    }
+
+    const rows = taskRows(batch);
+    if (!rows.tasks.length && !rows.errors.length)
+      return component([`    ${dim(theme, "⎿")} ${dim(theme, "Tasks unchanged")}`]);
+    return component(width => {
+      const lines = rows.tasks.flatMap((task, index) => [renderTaskResult(task, index === 0, width, theme), ...renderQuestionLines(task, "      ", width, theme)]);
+      for (const message of rows.errors) {
+        const prefix = lines.length ? "      " : "    ⎿ ";
+        lines.push(`${prefix}${style(theme, "error", "✗")} ${truncate(message, Math.max(0, width - taskDisplayWidth(prefix) - 2))}`);
+      }
+      return lines;
+    });
+  },
+};
+
+function categoryLetter(category?: Category): string {
+  return category === "researching" ? "R" : category === "planning" ? "P" :
+    category === "verifying" ? "V" : category === "debugging" ? "D" :
+    category === "documenting" ? "X" : "A";
+}
+
+function orderedOpenTasks(tasks: Task[]): Array<{ task: Task; depth: number }> {
+  const open = tasks.filter(task => task.status === "pending" || task.status === "in_progress");
+  const visible = new Set(open.map(task => task.id));
+  const children = new Map<string, Task[]>();
+  const roots: Task[] = [];
+  for (const task of open) {
+    if (task.parentTaskId && visible.has(task.parentTaskId))
+      children.set(task.parentTaskId, [...(children.get(task.parentTaskId) ?? []), task]);
+    else roots.push(task);
+  }
+  const rank = (task: Task) => task.active ? 0 : task.status === "in_progress" ? 1 : 2;
+  const output: Array<{ task: Task; depth: number }> = [];
+  const visit = (task: Task, depth: number) => {
+    output.push({ task, depth });
+    for (const child of (children.get(task.id) ?? []).sort((a, b) => rank(a) - rank(b))) visit(child, depth + 1);
+  };
+  for (const task of roots.sort((a, b) => rank(a) - rank(b))) visit(task, 0);
+  return output;
+}
+
+export function taskWidgetRenderer(tasks: Task[], theme: RenderTheme): RenderComponent {
+  const summary = taskFocusSummary(tasks);
+  return component(width => {
+    const rows = [bold(theme,dim(theme,truncate(`Tasks  ${summary.completed}/${summary.completed+summary.open} done   /tasks`,width)))];
+    const task=summary.focus;
+    rows.push(task ? style(theme,"accent",bold(theme,truncate(`  ● #${task.id} ${task.subject}  Q ${summary.focusQuestions.answered}/${summary.focusQuestions.total}`,width))) : dim(theme,truncate("  ○ No task focused",width)));
+    if(task) {
+      if(!task.questions?.length) rows.push(style(theme,"warning",truncate("    ! Acceptance questions missing — repair required",width)));
+      for(const q of task.questions??[]) {
+        const answered=task.answers?.some(a=>a.question===q.id&&a.answer?.trim()&&a.evidence?.trim());
+        rows.push(style(theme,answered?"success":"warning",truncate(`    ${answered?"✓":"?"} ${q.id}: ${q.text}`,width)));
+      }
+    }
+    rows.push(dim(theme,truncate(summary.next ? `  ↳ Next #${summary.next.id} ${summary.next.subject}` : "  ↳ No unblocked next task",width)));
+    return rows;
+  });
+}
+
+export const taskFocusSummary = (tasks: Task[], shortcut = "/tasks") => {
+  const current = tasks.filter(task => task.status !== "deleted");
+  const byId = new Map(current.map(task => [task.id, task]));
+  const blocked = (task: Task) => task.dependsOn.some(id => byId.get(id)?.status !== "completed");
+  const openTasks = current.filter(task => task.status === "pending" || task.status === "in_progress");
+  const focus = current.find(task => task.active && task.status === "in_progress");
+  const focusQuestions = focus ? questionSummary(focus) : { total: 0, answered: 0, unresolved: [], malformed: false };
+  const eligible = openTasks.filter(task => !blocked(task) && task.id !== focus?.id && !openTasks.some(child=>child.parentTaskId===task.id));
+  return { open: openTasks.length, blocked: openTasks.filter(blocked).length,
+    completed: current.filter(task => task.status === "completed").length,
+    focus, focusQuestions, next: eligible[0], remaining: eligible.length, shortcut };
+};
+
+export class TaskManager {
+  private state: State = { nextId: 1, tasks: [], keys: {} };
+  private revision = 0;
+  private stats: TaskMetrics = { mutations: 0, reads: 0, failures: 0, lastRevision: 0 };
+  constructor(
+    private readonly persist?: (entry: JournalEntry) => void,
+    private readonly emitOperation?: (event: OperationEvent) => void,
+    private readonly options: TaskManagerOptions = {},
+  private worktrees: { at: number; roots: string[] } | undefined = undefined,
+  ) {
+    if (options.resolveEvidence && (options.evidenceRoots !== undefined || options.canReadEvidence !== undefined)) throw new Error("resolveEvidence is an exclusive trusted resolver; do not combine it with evidenceRoots or canReadEvidence");
+  }
+  snapshot(): State { return clone(this.state); }
+  metrics(): TaskMetrics { return { ...this.stats }; }
+  /** Append a compact, already-sanitized tool observation to the focused task. */
+  appendActiveAuditEvent(event: Omit<AuditEvent, "action" | "at"> & { at?: string }): boolean {
+    const task = this.state.tasks.find(candidate => candidate.status === "in_progress" && candidate.active);
+    if (!task) return false;
+    const at = event.at ?? new Date().toISOString();
+    (task.audit_events ??= []).push({ action: "tool", at, ...event });
+    task.updatedAt = at;
+    this.commit();
+    return true;
+  }
+  restore(state: State): void {
+    const restored = clone(state);
+    // Journals are untrusted compatibility data. Normalize the complete graph
+    // at the persistence boundary so an old/corrupt snapshot cannot create an
+    // impossible focus state or make later mutations fail unexpectedly.
+    if (!restored || !Array.isArray(restored.tasks) || !Number.isFinite(restored.nextId) ||
+      !isObj(restored.keys)) {
+      this.state = { nextId: 1, tasks: [], keys: {} };
+      return;
+    }
+    const tasks = restored.tasks.filter(task => isObj(task) && typeof task.id === "string" &&
+      task.id.trim() && typeof task.subject === "string" && task.subject.trim()).map(task => {
+      const normalized = task as Task;
+      normalized.subject = normalized.subject.trim();
+      normalized.status = ["pending", "in_progress", "completed", "deleted"].includes(normalized.status as string)
+        ? normalized.status : "pending";
+      normalized.priority = PRIORITIES.includes(normalized.priority) ? normalized.priority : "medium";
+      normalized.category = CATEGORIES.includes(normalized.category as Category) ? normalized.category : "acting";
+      normalized.dependsOn = Array.isArray(normalized.dependsOn) ? [...new Set(normalized.dependsOn.filter(id => typeof id === "string" && id !== normalized.id))] : [];
+      normalized.notes = Array.isArray(normalized.notes) ? normalized.notes.filter(note => typeof note === "string") : [];
+      normalized.questions = Array.isArray(normalized.questions) ? normalized.questions.filter(question => this.validQuestion(question)) : undefined;
+      normalized.answers = Array.isArray(normalized.answers) ? normalized.answers.filter(answer => this.validAnswer(answer)) : undefined;
+      normalized.active = normalized.status === "in_progress" && normalized.active === true;
+      if (normalized.parentTaskId === normalized.id || typeof normalized.parentTaskId !== "string") delete normalized.parentTaskId;
+      normalized.audit_events = Array.isArray(normalized.audit_events) ? normalized.audit_events.filter(event =>
+        isObj(event) && typeof event.at === "string" && typeof event.action === "string") as AuditEvent[] : [];
+      if (!Array.isArray(normalized.typed_notes)) delete normalized.typed_notes;
+      return normalized;
+    });
+    const ids = new Set(tasks.map(task => task.id));
+    for (const task of tasks) {
+      task.dependsOn = task.dependsOn.filter(id => ids.has(id));
+      if (task.parentTaskId && !ids.has(task.parentTaskId)) delete task.parentTaskId;
+    }
+    // Break malformed parent cycles deterministically by removing the edge
+    // from the first task that closes a cycle.
+    for (const task of tasks) {
+      const seen = new Set<string>();
+      let current: Task | undefined = task;
+      while (current?.parentTaskId) {
+        if (seen.has(current.id)) { delete task.parentTaskId; break; }
+        seen.add(current.id);
+        current = tasks.find(candidate => candidate.id === current!.parentTaskId);
+      }
+    }
+    // Focus is singular. Preserve the first valid active task and clear all
+    // later focus flags, matching FocusTodo's one-task invariant.
+    let focused = false;
+    for (const task of tasks) {
+      if (task.active && !focused) focused = true;
+      else task.active = false;
+    }
+    const keys: Record<string, string> = {};
+    for (const [key, id] of Object.entries(restored.keys)) if (typeof id === "string" && ids.has(id)) keys[key] = id;
+    const maxID = tasks.reduce((max, task) => Math.max(max, Number(task.id) || 0), 0);
+    this.state = { nextId: Math.max(1, Math.floor(restored.nextId), maxID + 1), tasks, keys };
+  }
+  rehydrate(entries: readonly JournalEntry[]): void {
+    this.state = { nextId: 1, tasks: [], keys: {} };
+    this.revision = 0;
+    this.stats = { mutations: 0, reads: 0, failures: 0, lastRevision: 0 };
+    const replayed = replayLatest<State>(entries, "pi-swarm-task-state", (value) => value as State);
+    if (replayed) {
+      this.restore(replayed.state);
+      this.revision = replayed.revision;
+      this.stats.lastRevision = this.revision;
+    }
+  }
+  private commit(): void {
+    this.revision++;
+    this.stats.mutations++;
+    this.stats.lastRevision = this.revision;
+    this.persist?.({ type: "pi-swarm-task-state", data: snapshot(this.snapshot(), this.revision) });
+  }
+  private find(id: string): Task | undefined { return this.state.tasks.find(t => t.id === id); }
+  private resolve(ref: Ref | undefined, local: Record<string, string>): string | Failure {
+    // Canonical IDs are decimal strings, but callers emit them as JSON numbers
+    // (trebol#33/#35/#36); accept the integer form everywhere a ref is taken.
+    if (typeof ref === "number" && Number.isInteger(ref)) ref = String(ref);
+    if (isObj(ref) && typeof ref.ref === "number" && Number.isInteger(ref.ref)) ref = { ...ref, ref: String(ref.ref) };
+    if (typeof ref === "string") {
+      // A real task ID wins. Otherwise accept a key from this batch or the
+      // persistent ledger, matching the {"ref":…} form below so dependency
+      // arrays resolve the same targets regardless of ref shape.
+      return this.find(ref) ? ref : local[ref] ?? this.state.keys[ref] ?? ref;
+    }
+    if (!ref) return fail("validation_failed", "taskId is required");
+    if (ref.field && ref.field !== "taskId") return fail("validation_failed", "reference field must be taskId");
+    // Keys resolve first, then a literal task ID: the documented {"ref":…} form
+    // must also reach a task that list already shows under that ID (trebol#33).
+    const id = local[ref.ref] ?? this.state.keys[ref.ref] ?? (this.find(ref.ref) ? ref.ref : undefined);
+    return id ?? fail("reference_failed", `reference ${ref.ref} is not available`);
+  }
+  private inferCategory(text: string): Category {
+    const value = text.toLowerCase();
+    const rules: [Category, string[]][] = [
+      ["planning", ["plan", "design", "architect", "strategy", "specification", "specify", "outline", "draft", "proposal", "tech spec", "write spec", "create spec"]],
+      ["researching", ["research", "explore", "investigate", "search", "find", "analyze", "read", "understand", "study", "review docs", "check docs", "examine", "discover"]],
+      ["debugging", ["debug", "troubleshoot", "trace error", "trace bug", "resolve error", "resolve issue", "investigate error", "fix bug", "fix error", "fix crash", "fix panic", "stack trace", "segfault", "deadlock"]],
+      ["verifying", ["test", "verify", "validate", "check", "confirm", "assert", "ensure", "prove", "inspect"]],
+      ["documenting", ["document", "write docs", "add docs", "update docs", "readme", "changelog", "comment", "comments", "documentation", "docstring", "javadoc", "godoc"]],
+    ];
+    for (const [category, words] of rules) if (words.some(word => value.includes(word))) return category;
+    return "acting";
+  }
+  private validate(op: Operation, index: number): Failure | undefined {
+    if (!isObj(op) || typeof op.key !== "string" || !op.key || !["create","update","get","list"].includes(op.op))
+      return fail("validation_failed", `operation ${index} must contain a valid key and op`);
+    for (const field of Object.keys(op as object)) if (!OPERATION_FIELDS[op.op]?.includes(field))
+      return fail("validation_failed", `operation ${op.key}: field ${field} is not valid for ${op.op}`);
+    for (const field of ["taskId", "parentTaskId"] as const) {
+      const error = this.validateRef((op as Record<string, unknown>)[field], field);
+      if (error) return error;
+    }
+    for (const field of ["addBlocks", "addBlockedBy"] as const) {
+      const refs = (op as Record<string, unknown>)[field];
+      if (refs !== undefined && (!Array.isArray(refs) || refs.some(ref => ref === undefined || this.validateRef(ref, field)))) {
+        return fail("validation_failed", `operation ${op.key}: ${field} must contain only task IDs or {ref, field:"taskId"} references`);
+      }
+    }
+    const stringFields = ["subject", "description", "activeForm", "owner_id", "addNote", "noteType", "category", "priority", "status"] as const;
+    for (const field of stringFields) {
+      if ((op as Record<string, unknown>)[field] !== undefined && typeof (op as Record<string, unknown>)[field] !== "string")
+        return fail("validation_failed", `operation ${op.key}: ${field} must be a string`);
+    }
+    if (op.metadata !== undefined && (!isObj(op.metadata) || !this.isJSONValue(op.metadata)))
+      return fail("validation_failed", `operation ${op.key}: metadata must be a JSON-compatible object`);
+    const questionError = this.validateQuestions(op.questions, op.key);
+    if (questionError) return questionError;
+    const answerError = this.validateAnswers(op.answers, op.key);
+    if (answerError) return answerError;
+    for (const field of ["active", "include_audit"] as const) {
+      if ((op as Record<string, unknown>)[field] !== undefined && typeof (op as Record<string, unknown>)[field] !== "boolean")
+        return fail("validation_failed", `operation ${op.key}: ${field} must be a boolean`);
+    }
+    if (op.op === "create" && (!op.subject || !op.subject.trim())) return fail("validation_failed", `operation ${op.key}: subject must not be blank`);
+    if (op.active === true && (op.op === "create" || op.status !== undefined) && op.status !== "in_progress")
+      return fail("validation_failed", `operation ${op.key}: active task must be in_progress`);
+    if (op.category !== undefined && !CATEGORIES.includes(op.category)) return fail("validation_failed", `operation ${op.key}: invalid category ${op.category}`);
+    if (op.priority !== undefined && !PRIORITIES.includes(op.priority)) return fail("validation_failed", `operation ${op.key}: invalid priority ${op.priority}`);
+    if (op.status !== undefined && !["pending","in_progress","completed","deleted"].includes(op.status)) return fail("validation_failed", `operation ${op.key}: invalid status ${op.status}`);
+    if (op.op === "create" && op.status === "completed") return fail("validation_failed", `operation ${op.key}: tasks must be created pending or in_progress and completed only after evidence-backed work`);
+    if (op.op === "create" && (!Array.isArray(op.questions) || op.questions.length === 0)) return fail("validation_failed", `operation ${op.key}: new tasks require 1..${MAX_TASK_QUESTIONS} task-specific acceptance questions`);
+    if (op.noteType !== undefined && !NOTE_TYPES.includes(op.noteType)) return fail("validation_failed", `operation ${op.key}: invalid noteType ${op.noteType}`);
+    if (op.limit !== undefined && (!Number.isInteger(op.limit) || op.limit < 1 || op.limit > 500)) return fail("validation_failed", `operation ${op.key}: limit must be 1..500`);
+    if (op.offset !== undefined && (!Number.isInteger(op.offset) || op.offset < 0)) return fail("validation_failed", `operation ${op.key}: offset must be non-negative`);
+    return undefined;
+  }
+  private isJSONValue(value: unknown, seen = new Set<unknown>()): boolean {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+    if (typeof value === "number") return Number.isFinite(value);
+    if (typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    const valid = Array.isArray(value)
+      ? value.every(item => this.isJSONValue(item, seen))
+      : isObj(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null) &&
+        Object.values(value).every(item => this.isJSONValue(item, seen));
+    seen.delete(value);
+    return valid;
+  }
+  private validateRef(value: unknown, field: string): Failure | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value === "number" && Number.isInteger(value)) value = String(value);
+    else if (isObj(value) && typeof value.ref === "number" && Number.isInteger(value.ref)) value = { ...value, ref: String(value.ref) };
+    if (typeof value === "string") {
+      return value.trim() || field === "parentTaskId"
+        ? undefined
+        : fail("validation_failed", `${field} must be a task ID or reference`);
+    }
+    if (!isObj(value) || typeof value.ref !== "string" || !value.ref.trim() ||
+      (value.field !== undefined && value.field !== "taskId") ||
+      Object.keys(value).some(key => key !== "ref" && key !== "field"))
+      return fail("validation_failed", `${field} must be a task ID or {ref, field:"taskId"} reference`);
+    return undefined;
+  }
+  private validQuestion(value: unknown): value is TaskQuestion {
+    return isObj(value) && Object.keys(value).every(key => key === "id" || key === "text") && typeof value.id === "string" && value.id.trim().length > 0 && value.id.length <= MAX_QUESTION_ID_LENGTH && typeof value.text === "string" && value.text.trim().length > 0 && value.text.length <= MAX_QUESTION_TEXT_LENGTH;
+  }
+  private validAnswer(value: unknown): value is TaskAnswer { return isObj(value) && Object.keys(value).every(key => key === "question" || key === "answer" || key === "evidence") && typeof value.question === "string" && value.question.trim().length > 0 && value.question.length <= MAX_QUESTION_ID_LENGTH && typeof value.answer === "string" && value.answer.trim().length > 0 && value.answer.length <= MAX_ANSWER_LENGTH && (typeof value.evidence === "string" && value.evidence.trim().length > 0 && value.evidence.length <= MAX_EVIDENCE_LENGTH); }
+  private validateQuestions(questions: unknown, key: string): Failure | undefined {
+    if (questions === undefined) return;
+    if (!Array.isArray(questions) || questions.length < 1 || questions.length > MAX_TASK_QUESTIONS || questions.some(q => !this.validQuestion(q)) || new Set(questions.map(q => (q as TaskQuestion).id)).size !== questions.length) return fail("validation_failed", `operation ${key}: questions must contain 1..${MAX_TASK_QUESTIONS} unique {id,text} items within bounds`);
+  }
+  private validateAnswers(answers: unknown, key: string): Failure | undefined {
+    if (answers === undefined) return;
+    if (!Array.isArray(answers)) return fail("validation_failed", `operation ${key}: answers must be an array`);
+    if (answers.length < 1 || answers.length > MAX_TASK_QUESTIONS) return fail("validation_failed", `operation ${key}: answers must contain 1..${MAX_TASK_QUESTIONS} items`);
+    for (const [index, answer] of answers.entries()) {
+      if (!isObj(answer)) return fail("validation_failed", `operation ${key}: answers[${index}] must be an object`);
+      if (typeof answer.question !== "string" || !answer.question.trim()) return fail("validation_failed", `operation ${key}: answers[${index}].question must be a non-empty string`);
+      if (answer.question.length > MAX_QUESTION_ID_LENGTH) return fail("validation_failed", `operation ${key}: answers[${index}].question exceeds ${MAX_QUESTION_ID_LENGTH} characters`);
+      if (typeof answer.answer !== "string" || !answer.answer.trim()) return fail("validation_failed", `operation ${key}: answers[${index}].answer must be a non-empty string`);
+      if (answer.answer.length > MAX_ANSWER_LENGTH) return fail("validation_failed", `operation ${key}: answers[${index}].answer exceeds ${MAX_ANSWER_LENGTH} characters`);
+      if (typeof answer.evidence !== "string" || !answer.evidence.trim()) return fail("validation_failed", `operation ${key}: answers[${index}].evidence must be a non-empty string`);
+      if (answer.evidence.length > MAX_EVIDENCE_LENGTH) return fail("validation_failed", `operation ${key}: answers[${index}].evidence exceeds ${MAX_EVIDENCE_LENGTH} characters`);
+      if (Object.keys(answer).some(field => !["question", "answer", "evidence"].includes(field))) return fail("validation_failed", `operation ${key}: answers[${index}] contains an unknown field`);
+    }
+    const duplicate = answers.findIndex((answer, index) => answers.findIndex(other => (other as TaskAnswer).question === (answer as TaskAnswer).question) !== index);
+    if (duplicate >= 0) return fail("validation_failed", `operation ${key}: answers[${duplicate}].question duplicates an earlier question id`);
+  }
+  /**
+   * Saved answers survive when their question still exists with identical
+   * text; a reworded or removed question drops only its own answer.
+   */
+  private retainedAnswers(task: Task, questions: TaskQuestion[] | undefined): TaskAnswer[] {
+    if (!questions) return [...(task.answers ?? [])];
+    const textById = new Map((task.questions ?? []).map(question => [question.id, question.text]));
+    return (task.answers ?? []).filter(answer => {
+      const current = questions.find(question => question.id === answer.question);
+      return !!current && textById.get(answer.question) === current.text;
+    });
+  }
+  /** Supplied answers override saved ones by question ID; order follows the question list. */
+  private mergeAnswers(task: Task, op: Operation): TaskAnswer[] {
+    if (op.questions === undefined && !task.questions?.length && !op.answers?.length) return clone(task.answers ?? []);
+    const questions = op.questions ?? task.questions ?? [];
+    const merged = new Map(this.retainedAnswers(task, op.questions).map(answer => [answer.question, answer]));
+    for (const answer of op.answers ?? []) {
+      const saved = clone(answer);
+      if (this.options.canonicalizeToolEvidence) saved.evidence = splitEvidence(saved.evidence).map(ref => this.options.canonicalizeToolEvidence!(ref)).join("; ");
+      merged.set(answer.question, saved);
+    }
+    return questions.filter(question => merged.has(question.id)).map(question => merged.get(question.id)!);
+  }
+  private completionError(task: Task, op: Operation): Failure | undefined {
+    if (task.status === "completed" && op.questions !== undefined && (op.status === undefined || op.status === "completed")) return fail("validation_failed", "reopen task before changing questions");
+    if (op.status !== "completed" && op.status !== "in_progress") return;
+    if (!task.questions?.length) return fail("validation_failed", `task ${task.id} is a legacy questionless task; repair it with task-specific questions before resuming or completing`);
+    if (op.status !== "completed") return;
+    if (op.questions !== undefined) return fail("validation_failed", "cannot replace or drop questions while completing a task");
+    const ids = new Set<string>();
+    const malformed = task.questions.some(question => !this.validQuestion(question) || ids.has(question.id) || !ids.add(question.id));
+    if (malformed) return fail("validation_failed", `cannot complete task ${task.id}: task questions are malformed or duplicated. Re-read the task and repair questions before completing`);
+    const supplied = new Set<string>();
+    for (const answer of op.answers ?? []) {
+      if (supplied.has(answer.question)) return fail("validation_failed", `duplicate answer for question id: ${answer.question}`);
+      supplied.add(answer.question);
+      if (!ids.has(answer.question)) return fail("validation_failed", `unknown question id: ${answer.question}`);
+    }
+    const answers = this.mergeAnswers(task, op);
+    const seen = new Set(answers.map(answer => answer.question));
+    const missing = task.questions.filter(question => !seen.has(question.id));
+    if (missing.length) return fail("validation_failed", `missing answers for question(s): ${missing.map(question => `${question.id} (${question.text})`).join("; ")}. Re-read the task, then retry with status:"completed" and answers:[{question:"<question id>",answer:"<truthful answer>",evidence:"path/to/file.md#Heading, path/to/file.ts#L1-L2, or tool:<ToolName>#<n> for a live tool result from this session"}] for every listed question; do not invent answers or evidence`);
+    for (const answer of answers) {
+      if (!answer.evidence) continue;
+      const unresolved = splitEvidence(answer.evidence).flatMap(reference => {
+        this.evidenceReason = "unavailable";
+        return this.resolveEvidence(reference) ? [] : [`${reference} (${this.evidenceReason})`];
+      });
+      // Name the reference that failed: echoing the whole string forces the
+      // caller to bisect a citation list to find the one bad entry.
+      if (unresolved.length) return fail("validation_failed", `evidence reference is unavailable: ${unresolved.join("; ")}`);
+    }
+  }
+  /**
+   * Accept the citation shapes agents actually write. A bare path cites a whole
+   * file; `#Lx`, `#Lx-Ly` and `#Heading` narrow it. Multi-file citations are
+   * split by `splitEvidence` before reaching here.
+   */
+  private evidenceReason = "unavailable";
+  private resolveEvidence(reference: string): boolean {
+    if (this.options.resolveEvidence) {
+      if (this.options.evidenceRoots !== undefined || this.options.canReadEvidence !== undefined) { this.evidenceReason = "conflicting_resolver_policy"; return false; }
+      return this.options.resolveEvidence(reference) === true;
+    }
+    if (/^tool:/i.test(reference)) { this.evidenceReason = "tool_result_unavailable: use an exact registered tool name and a current-branch result index" + (this.options.sessionEvidenceHints?.() ?? ""); return this.options.resolveSessionEvidence?.(reference) === true; }
+    const match = /^([^#]+?)(?:#(L\d+(?:-L\d+)?|[^#\s].*))?$/.exec(reference.trim());
+    if (!match || !this.options.workspaceRoot) { this.evidenceReason = "invalid_reference_or_missing_workspace"; return false; }
+    // A workspace-relative citation resolves against the primary root first;
+    // failing that, against the repository's linked worktrees (trebol#124,
+    // trebol#127): agents routinely work in an isolated worktree while the
+    // host process keeps the main checkout as cwd, and absolute citations
+    // into that worktree must resolve too.
+    const roots = [resolvePath(this.options.workspaceRoot), ...this.linkedWorktreeRoots(), ...(this.options.evidenceRoots ?? []).map(root => resolvePath(root))];
+    this.evidenceReason = "outside_allowed_roots: use the workspace, a linked worktree, or a host-authorized evidence root";
+    for (const root of roots) {
+      const file = resolvePath(root, match[1]);
+      const rel = relativePath(root, file);
+      if (isAbsolute(rel) || rel === ".." || rel.startsWith("../")) continue;
+      try {
+        this.evidenceReason = "missing_file";
+        const physical = relativePath(realpathSync(root), realpathSync(file));
+        if (isAbsolute(physical) || physical === ".." || physical.startsWith("../")) { this.evidenceReason = "outside_allowed_roots: symlink escape"; continue; }
+        if (this.options.canReadEvidence && this.options.canReadEvidence(realpathSync(file)) !== true) { this.evidenceReason = "access_denied"; continue; }
+        const stat = statSync(file); if (!stat.isFile()) { this.evidenceReason = "not_a_file"; continue; }
+        if (stat.size > 1024 * 1024) { this.evidenceReason = "file_too_large"; continue; }
+        const text = readFileSync(file, "utf8"), section = match[2];
+        if (section === undefined) return true;
+        const lines = /^L(\d+)(?:-L(\d+))?$/.exec(section);
+        if (lines) {
+          const start = Number(lines[1]), end = lines[2] === undefined ? start : Number(lines[2]);
+          this.evidenceReason = "invalid_line_range";
+          return start >= 1 && end >= start && end <= text.split("\n").length;
+        }
+        this.evidenceReason = "missing_heading";
+        if (!/\.md$/i.test(file)) return false;
+        // Headings legally contain ?, parentheses, commas and other punctuation
+        // (trebol#36). Match the quoted section exactly, as a GitHub-style dash
+        // slug, or punctuation-insensitively on both sides, so an agent quoting
+        // the heading with or without its punctuation still resolves.
+        const loose = (value: string) => value.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+        return text.split("\n").some(line => {
+          if (!/^#{1,6}\s+/.test(line)) return false;
+          const heading = line.replace(/^#{1,6}\s+/, "").trim();
+          return heading === section ||
+            heading.toLowerCase().replace(/[^\p{L}\p{N} _-]/gu, "").replace(/ /g, "-") === section ||
+            loose(heading) === loose(section);
+        });
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        this.evidenceReason = code === "ENOENT" || code === "ENOTDIR" ? "missing_file" : code === "EACCES" || code === "EPERM" ? "access_denied" : "evidence_io_error";
+        continue;
+      }
+    }
+    return false;
+  }
+  /**
+   * Linked worktrees of the workspace repository, primary root excluded.
+   * Discovery refreshes `git worktree list` once per execute batch
+   * and degrades to an empty list outside a git repository or without git.
+   */
+  private linkedWorktreeRoots(): string[] {
+    const now = Date.now();
+    if (!this.worktrees) {
+      let list: string[] = [];
+      try {
+        const out = execFileSync("git", ["-C", String(this.options.workspaceRoot), "worktree", "list", "--porcelain"], { timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).toString();
+        list = out.split("\n").filter(line => line.startsWith("worktree ")).map(line => line.slice("worktree ".length));
+      } catch { list = []; }
+      this.worktrees = { at: now, roots: list };
+    }
+    let primary = "";
+    try { primary = this.options.workspaceRoot ? realpathSync(this.options.workspaceRoot) : ""; } catch { /* Missing roots fail evidence resolution, not execution. */ }
+    return this.worktrees.roots.filter(root => root !== primary).filter(root => existsSync(root));
+  }
+  execute(params: Params, signal?: AbortSignal): Batch {
+    this.worktrees = undefined; // One discovery per batch; never retain revoked worktrees across calls.
+    if (!isObj(params))
+      return { status: "failed", results: [{ key: "batch", op: "list", status: "failed", error: fail("validation_failed", "unknown batch field") }] };
+    const unknownField = Object.keys(params).find(key => key !== "operations" && key !== "mode" && key !== "description");
+    if (unknownField !== undefined)
+      return { status: "failed", results: [{ key: "batch", op: "list", status: "failed", error: fail("validation_failed", `unknown top-level field ${JSON.stringify(unknownField)}`) }] };
+    if (params.description !== undefined && typeof params.description !== "string")
+      return { status: "failed", results: [{ key: "batch", op: "list", status: "failed", error: fail("validation_failed", "description must be a string") }] };
+    const ops = Array.isArray(params.operations)
+      ? params.operations.map(operation => {
+          if (!isObj(operation)) return operation;
+          const normalized = { ...operation } as Operation;
+          const untrusted = normalized as unknown as Record<string, unknown>;
+          for (const field of ["category", "priority", "status", "noteType"] as const) {
+            if (untrusted[field] === "") delete normalized[field];
+          }
+          return normalized;
+        })
+      : params.operations;
+    if (Array.isArray(ops)) this.stats.reads += ops.filter(op => op?.op === "get" || op?.op === "list").length;
+    if (!Array.isArray(ops) || !ops.length || ops.length > 50) return { status: "failed", results: [{ key: "batch", op: "list", status: "failed", error: fail("validation_failed", "operations must contain 1..50 operations") }] };
+    if (params.mode && params.mode !== "sequential" && params.mode !== "atomic") return { status: "failed", results: [{ key: "batch", op: "list", status: "failed", error: fail("validation_failed", "unsupported mode") }] };
+    const seen = new Map<string, "create"|"update"|"get"|"list">();
+    for (let i=0;i<ops.length;i++) {
+      const e = this.validate(ops[i], i); if (e) return { status: "failed", results: [{ key: ops[i]?.key ?? "batch", op: ops[i]?.op ?? "list", status: "failed", error: e }] };
+      const prior = seen.get(ops[i].key);
+      if (prior && (prior === "create" || ops[i].op === "create") && !(prior === "create" && ops[i].op !== "create")) return { status: "failed", results: [{ key: ops[i].key, op: ops[i].op, status: "failed", error: fail("validation_failed", `duplicate operation key ${ops[i].key}`) }] };
+      seen.set(ops[i].key, prior ?? ops[i].op);
+    }
+    const before = this.snapshot(), local: Record<string,string> = {}, results: Result[] = [];
+    let stopped = false;
+    for (const op of ops) {
+      if (stopped) { results.push({ key: op.key, op: op.op, status: "skipped" }); continue; }
+      if (signal?.aborted) { results.push({ key: op.key, op: op.op, status: "failed", error: fail("cancelled", "operation cancelled") }); stopped = true; continue; }
+      const operationBefore = this.snapshot(), localBefore = { ...local };
+      // Create keys are idempotency keys for retries. Update keys are ordinary
+      // per-call aliases and may intentionally be reused as work progresses.
+      const existingId = op.op === "create" ? this.state.keys[op.key] : undefined;
+      let result: Result;
+      try {
+        result = existingId ? this.replayedCreate(op, existingId) : this.run(op, local);
+      } catch {
+        // Host callbacks are fallible. Roll back through the normal failure path
+        // and never expose callback exception text (which may contain secrets).
+        result = { key: op.key, op: op.op, status: "failed", error: fail("validation_failed", "operation validation failed unexpectedly; inspect host evidence configuration") };
+      }
+      results.push(result);
+      if (result.status === "succeeded" && !existingId &&
+        (op.op === "create" || (op.op === "update" && op.status !== "deleted"))) {
+        const produced = result.data as any;
+        if (produced?.task?.id) { this.state.keys[op.key] = produced.task.id; local[op.key] = produced.task.id; }
+      }
+      if (result.status === "failed") {
+        stopped = true;
+        this.restore(params.mode === "atomic" ? before : operationBefore);
+        for (const key of Object.keys(local)) delete local[key];
+        Object.assign(local, localBefore);
+        if (params.mode === "atomic") this.restore(before);
+      } else if (result.status === "succeeded" && params.mode !== "atomic" &&
+        (op.op === "create" || op.op === "update")) {
+        // Journal successful mutations only. Reads do not change durable state.
+        this.commit();
+      }
+    }
+    if (params.mode === "atomic" && !stopped &&
+      ops.some((op, i) => (op.op === "create" || op.op === "update") && results[i]?.status === "succeeded")) this.commit();
+    if (params.mode === "atomic" && stopped) {
+      this.restore(before); // Includes cancellation, which bypasses run() failure handling.
+      const failedIndex = results.findIndex(r => r.status === "failed");
+      for (let i = 0; i < failedIndex; i++) {
+        results[i] = { ...results[i], status: "failed", data: undefined,
+          error: fail("atomic_rollback", "operation was rolled back because the atomic batch failed") };
+      }
+    }
+    const status = params.mode === "atomic" && stopped ? "failed" :
+      stopped ? (results.some(r => r.status === "succeeded") ? "partial" : "failed") : "succeeded";
+    this.stats.failures += results.filter(result => result.status === "failed").length;
+    const batch = { status, results } as Batch;
+    this.emitOperation?.({ type: "pi-swarm-task-operation", data: {
+      mode: params.mode ?? "sequential", status, results: clone(results), at: new Date().toISOString(),
+    } });
+    return batch;
+  }
+  /** Identifies a create request; the same key with a different request is a conflict, not a retry. */
+  private createFingerprint(op: Operation): string {
+    return createHash("sha256").update(JSON.stringify(sortKeysDeep({ ...op, subject: op.subject?.trim() }))).digest("hex");
+  }
+  private replayedCreate(op: Operation, id: string): Result {
+    const task = this.find(id);
+    if (!task) return { key: op.key, op: op.op, status: "failed", error: fail("reference_failed", `operation key ${op.key} points to missing task ${id}`) };
+    // Tasks persisted before fingerprints carry no payload hash; compare the
+    // subject and questions they still store (fail closed on any mismatch).
+    const same = task.createFingerprint !== undefined
+      ? task.createFingerprint === this.createFingerprint(op)
+      : task.subject === op.subject?.trim() && JSON.stringify(sortKeysDeep(task.questions ?? [])) === JSON.stringify(sortKeysDeep(op.questions ?? []));
+    if (!same) return { key: op.key, op: op.op, status: "failed", error: fail("idempotency_conflict", `create key ${op.key} already created task ${id} with a different payload; use a fresh key for a new task`) };
+    return { key: op.key, op: op.op, status: "succeeded", data: { task: this.createAck(task) } };
+  }
+  private run(op: Operation, local: Record<string,string>): Result {
+    const target = (r?: Ref) => this.resolve(r, local);
+    if (op.op === "create") {
+      // Upstream permits active on create, but TodoItem validation requires
+      // an active task to be in progress. Creation then transfers sole focus.
+      if (op.active === true && op.status !== "in_progress")
+        return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`cannot create task ${op.subject}: active task must be in_progress`)};
+      const parent = op.parentTaskId === undefined ? undefined : target(op.parentTaskId); if (typeof parent !== "string" && op.parentTaskId) return { key:op.key,op:op.op,status:"failed",error:parent };
+      const parentId = typeof parent === "string" && parent !== "" ? parent : undefined;
+      if (parentId && !this.find(parentId)) return {key:op.key,op:op.op,status:"failed",error:fail("not_found",`task ${parentId} not found`)};
+      const deps = [...(op.addBlockedBy ?? [])].map(target);
+      if (deps.some(x=>typeof x!=="string")) return {key:op.key,op:op.op,status:"failed",error:deps.find(x=>typeof x!=="string") as Failure};
+      for (const d of deps as string[]) {
+        const dependency = this.find(d);
+        if (!dependency) return {key:op.key,op:op.op,status:"failed",error:fail("not_found",`dependency task ${d} not found`)};
+        if (op.status === "in_progress" && dependency.status !== "completed")
+          return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`cannot create task ${op.subject}: dependency ${d} is not completed`)};
+      }
+      const blocks = [...(op.addBlocks ?? [])].map(target);
+      if (blocks.some(x=>typeof x!=="string")) return {key:op.key,op:op.op,status:"failed",error:blocks.find(x=>typeof x!=="string") as Failure};
+      for (const d of blocks as string[]) if (!this.find(d)) return {key:op.key,op:op.op,status:"failed",error:fail("not_found",`task ${d} not found`)};
+      const owner = op.owner_id ?? "";
+      const sequence = this.state.tasks.filter(t => (t.owner_id ?? "") === owner).reduce((max, t) => Math.max(max, t.sequence ?? 0), 0) + 1;
+      const now = goNow(), task: Task = { id:String(this.state.nextId++), subject:op.subject!.trim(), description:op.description, activeForm:op.activeForm, category:op.category ?? this.inferCategory(`${op.subject} ${op.description ?? ""}`), priority:op.priority ?? "medium", metadata:op.metadata&&clone(op.metadata), parentTaskId:parentId, owner_id:op.owner_id, questions: op.questions ? clone(op.questions) : undefined, answers: undefined, status:op.status === "in_progress" || op.status === "completed" ? op.status : "pending", active:op.status === "in_progress" || op.active === true, dependsOn:[...new Set(deps as string[])], notes:op.addNote ? [op.addNote] : [], typed_notes: op.addNote && op.noteType ? [{text:op.addNote,type:op.noteType,at:now}] : undefined, audit_events:[{action:"created",at:now}], createdAt:now, updatedAt:now, sequence, createFingerprint:this.createFingerprint(op) };
+      this.state.tasks.push(task);
+      if (task.status === "in_progress") for (const other of this.state.tasks) if (other.id !== task.id) other.active = false;
+      for (const d of blocks as string[]) {
+        const other = this.find(d)!;
+        if (d === task.id || this.reaches(task.id, d) || this.reaches(d, task.id)) return {key:op.key,op:op.op,status:"failed",error:fail("cycle","dependency would create a cycle")};
+        if (!other.dependsOn.includes(task.id)) other.dependsOn.push(task.id);
+      }
+      return {key:op.key,op:op.op,status:"succeeded",data:{task:this.createAck(task)}};
+    }
+    if (op.op === "list") {
+      const filtered = this.state.tasks.filter(t =>
+        (!op.subject || t.subject.toLowerCase().includes(op.subject.toLowerCase())) &&
+        (op.category === undefined || t.category === op.category) &&
+        (op.status === undefined || t.status === op.status) &&
+        (op.active === undefined || t.active === op.active));
+      const offset=op.offset??0, limit=op.limit??50; return {key:op.key,op:op.op,status:"succeeded",data:{tasks:filtered.slice(offset,offset+limit).map(t=>this.summary(t)),pagination:{total:filtered.length,offset,limit,more:offset+limit<filtered.length}}};
+    }
+    const id = op.taskId === undefined
+      ? (local[op.key] ?? this.state.keys[op.key] ?? fail("reference_failed", `operation key ${op.key} is not available`))
+      : target(op.taskId);
+    if (typeof id !== "string") return {key:op.key,op:op.op,status:"failed",error:id};
+    const task=this.find(id); if (!task) return {key:op.key,op:op.op,status:"failed",error:fail("not_found",`task ${id} not found`)};
+    if (op.op==="get") return {key:op.key,op:op.op,status:"succeeded",data:{task:this.outputTask(task, op.include_audit)}};
+    const questionIds = new Set((op.questions ?? task.questions ?? []).map(q => q.id));
+    for (const answer of op.answers ?? []) if (!questionIds.has(answer.question))
+      return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed", `unknown question id: ${answer.question}`)};
+    const completionError = this.completionError(task, op);
+    if (completionError) return {key:op.key,op:op.op,status:"failed",error:completionError};
+    if (op.active === true && op.status === undefined && task.status !== "in_progress")
+      return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`cannot focus task ${id}: active task must be in_progress`)};
+    if (op.status === "deleted") {
+      if (this.state.tasks.some(t => t.parentTaskId === id))
+        return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`cannot delete task ${id}: child task still exists`)};
+      if (this.state.tasks.some(t => t.id !== id && t.dependsOn.includes(id)))
+        return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`cannot delete task ${id}: another task depends on it`)};
+      this.state.tasks = this.state.tasks.filter(t => t.id !== id);
+      for (const key of Object.keys(this.state.keys)) if (this.state.keys[key] === id) delete this.state.keys[key];
+      for (const key of Object.keys(local)) if (local[key] === id) delete local[key];
+      return {key:op.key,op:op.op,status:"succeeded",data:{}};
+    }
+    const deps = [...task.dependsOn]; for (const r of op.addBlockedBy??[]) { const d=target(r); if(typeof d!=="string") return {key:op.key,op:op.op,status:"failed",error:d}; if(!this.find(d)) return {key:op.key,op:op.op,status:"failed",error:fail("not_found",`dependency task ${d} not found`)}; if(d===id || this.reaches(d,id)) return {key:op.key,op:op.op,status:"failed",error:fail("cycle",`dependency would create a cycle`)}; if(!deps.includes(d)) deps.push(d); }
+    const resultingStatus = op.status ?? task.status;
+    if ((op.status === "in_progress" || op.active === true) && !(op.questions ?? task.questions)?.length)
+      return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`task ${id} is a legacy questionless task; repair it with task-specific questions before resuming`)};
+    if (resultingStatus === "in_progress") {
+      for (const dependency of deps) {
+        const dependencyTask = this.find(dependency);
+        if (dependencyTask?.status !== "completed")
+          return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`cannot set task ${id} to in_progress: dependency ${dependency} is not completed`)};
+      }
+    }
+    for (const r of op.addBlocks??[]) { const d=target(r); if(typeof d!=="string") return {key:op.key,op:op.op,status:"failed",error:d}; const other=this.find(d); if(!other) return {key:op.key,op:op.op,status:"failed",error:fail("not_found",`task ${d} not found`)}; if(d===id || this.reaches(id,d)) return {key:op.key,op:op.op,status:"failed",error:fail("cycle","dependency would create a cycle")}; if(!other.dependsOn.includes(id)) other.dependsOn.push(id); }
+    if (op.parentTaskId !== undefined) {
+      const p = target(op.parentTaskId);
+      if (typeof p !== "string") return {key:op.key,op:op.op,status:"failed",error:p};
+      if (p !== "") {
+        if (!this.find(p)) return {key:op.key,op:op.op,status:"failed",error:fail("not_found",`parent task ${p} not found`)};
+        if (p === id || this.parentReaches(p, id)) return {key:op.key,op:op.op,status:"failed",error:fail("cycle","parent would create a cycle")};
+      }
+    }
+    if (op.status === "completed") {
+      const child = this.state.tasks.find(t => t.parentTaskId === id && t.status !== "completed");
+      if (child) return {key:op.key,op:op.op,status:"failed",error:fail("validation_failed",`cannot complete task ${id}: child task ${child.id} is not completed`)};
+    }
+    const mergedMetadata: Record<string, unknown> | undefined = op.metadata === undefined ? task.metadata : { ...(task.metadata ?? {}), ...clone(op.metadata) };
+    if (op.metadata) for (const [key, value] of Object.entries(op.metadata)) if (value === null) delete (mergedMetadata as Record<string, unknown>)[key];
+    const parentTaskId = op.parentTaskId === undefined
+      ? task.parentTaskId
+      : target(op.parentTaskId) || undefined;
+    // Answers are tied to the questions they answer, not to the status.
+    // Reopening keeps them; a changed or removed question drops only its own
+    // answer, and supplied answers merge over saved ones by question ID.
+    const merged = this.mergeAnswers(task, op);
+    const answers = merged.length ? merged : undefined;
+    Object.assign(task, { subject:op.subject?.trim()||task.subject, description:op.description??task.description, activeForm:op.activeForm??task.activeForm, category:op.category??task.category, priority:op.priority??task.priority, metadata:mergedMetadata, questions:op.questions ? clone(op.questions) : task.questions, answers, status:op.status??task.status, active:op.active??task.active, parentTaskId, dependsOn:deps, updatedAt:goNow() });
+    if (op.status === "in_progress") {
+      for (const other of this.state.tasks) other.active = other.id === id;
+      // Explicit false is applied after the focus transition.
+      if (op.active === false) task.active = false;
+    } else if (op.status !== undefined) {
+      task.active = false;
+    } else if (op.active === true) {
+      for (const other of this.state.tasks) other.active = other.id === id;
+    }
+    const updatedAt = new Date().toISOString();
+    if(op.addNote) {
+      task.notes.push(op.addNote);
+      if (op.noteType !== undefined) (task.typed_notes ??= []).push({text:op.addNote,type:op.noteType,at:updatedAt});
+    }
+    (task.audit_events ??= []).push({action:"updated",at:updatedAt});
+    task.updatedAt = updatedAt;
+    return {key:op.key,op:op.op,status:"succeeded",data:{task:this.updateAck(op, task)}};
+  }
+  private createAck(task: Task): Record<string, unknown> {
+    return {id:task.id, subject:task.subject, status:task.status, active:task.active, parent_id:task.parentTaskId ?? "", ...(task.questions?.length ? {questions: clone(task.questions)} : {}), ...(task.answers?.length ? {answers: clone(task.answers)} : {})};
+  }
+  private updateAck(op: Operation, task: Task): Record<string, unknown> {
+    const ack: Record<string, unknown> = {...this.createAck(task)};
+    if (op.description !== undefined) ack.description = task.description;
+    if (op.activeForm !== undefined) ack.active_form = task.activeForm;
+    if (op.category !== undefined) ack.category = task.category;
+    if (op.priority !== undefined) ack.priority = task.priority;
+    if (op.metadata !== undefined) ack.metadata = task.metadata;
+    if ((op.addBlocks?.length ?? 0) > 0) ack.blocks = this.blockedBy(task.id);
+    if ((op.addBlockedBy?.length ?? 0) > 0) ack.depends_on = [...task.dependsOn];
+    if (op.addNote) ack.note_added = true;
+    return ack;
+  }
+  private summary(task: Task): Record<string, unknown> {
+    const result: Record<string, unknown> = {...this.createAck(task)};
+    if (task.activeForm) result.active_form = task.activeForm;
+    if (task.category) result.category = task.category;
+    if (task.priority) result.priority = task.priority;
+    if (task.dependsOn.length) result.depends_on = [...task.dependsOn];
+    const blocks = this.blockedBy(task.id); if (blocks.length) result.blocks = blocks;
+    if (task.owner_id) result.owner_id = task.owner_id;
+    return result;
+  }
+  private blockedBy(id: string): string[] { return this.state.tasks.filter(t => t.dependsOn.includes(id)).map(t => t.id); }
+  private outputTask(task: Task, includeAudit = false): Record<string, unknown> {
+    const result: Record<string, unknown> = {
+      id: task.id, content: task.subject, status: task.status,
+      priority: task.priority,
+      ...(task.active ? {active: true} : {}),
+      ...(task.description !== undefined ? {description: task.description} : {}),
+      ...(task.activeForm !== undefined ? {active_form: task.activeForm} : {}),
+      ...(task.metadata !== undefined ? {metadata: clone(task.metadata)} : {}),
+      ...(task.category !== undefined ? {category: task.category} : {}),
+      ...(task.dependsOn.length ? {depends_on: [...task.dependsOn]} : {}),
+      ...(this.blockedBy(task.id).length ? {blocks: this.blockedBy(task.id)} : {}),
+      ...(task.owner_id !== undefined ? {owner_id: task.owner_id} : {}),
+      ...(task.questions?.length ? {questions: clone(task.questions)} : {}),
+      ...(task.answers?.length ? {answers: clone(task.answers)} : {}),
+      ...(task.sequence ? {sequence: task.sequence} : {}),
+      ...(task.parentTaskId !== undefined ? {parent_id: task.parentTaskId} : {}),
+      ...(task.notes.length ? {notes: [...task.notes]} : {}),
+      created_at: task.createdAt, updated_at: task.updatedAt,
+      // TodoItem.LastSeen is a time.Time: omitempty never elides a struct, so
+      // the zero value is always rendered (taskstore sync sets it elsewhere).
+      last_seen: "0001-01-01T00:00:00Z",
+    };
+    if (includeAudit) {
+      if (task.audit_events) result.audit_events = task.audit_events.map(event => ({
+        type: event.action,
+        timestamp: event.at,
+        ...(event.actor !== undefined ? { actor: event.actor } : {}),
+        ...(event.summary !== undefined ? { summary: event.summary } : {}),
+        ...(event.tool !== undefined ? { tool: event.tool } : {}),
+        ...(event.toolCallId !== undefined ? { tool_call_id: event.toolCallId } : {}),
+        ...(event.outcome !== undefined ? { outcome: event.outcome } : {}),
+      }));
+      if (task.typed_notes) result.typed_notes = task.typed_notes.map(note => ({
+        type: note.type, content: note.text, created_at: note.at,
+      }));
+    }
+    return result;
+  }
+  private reaches(from:string, to:string, visited=new Set<string>()):boolean { if(visited.has(from)) return false; visited.add(from); const t=this.find(from); return !!t && (t.dependsOn.includes(to)||t.dependsOn.some(d=>this.reaches(d,to,visited))); }
+  private parentReaches(from:string, to:string, visited=new Set<string>()): boolean {
+    if (from === to) return true; if (visited.has(from)) return false; visited.add(from);
+    const parent = this.find(from)?.parentTaskId; return !!parent && this.parentReaches(parent, to, visited);
+  }
+}
+
+/**
+ * Resolve a session tool reference against the live Pi session branch.
+ *
+ * `tool:<Name>` cites the most recent tool result produced by that tool;
+ * `tool:<Name>#<n>` cites the n-th (1-based, chronological) result. The
+ * session manager is read at validation time, so results recorded earlier in
+ * the same turn are visible. Unknown tools, absent indices and out-of-range
+ * indices all fail closed.
+ */
+export interface EvidenceSessionManager {
+  getEntries(): readonly unknown[];
+  getBranch?(): readonly unknown[];
+}
+interface EvidenceContext {
+  sessionManager?: EvidenceSessionManager;
+  ui?: { setWidget(key: string, content: unknown): void };
+}
+function sessionResultNames(session: EvidenceSessionManager | undefined): string[] {
+  if (!session) return [];
+  const entries = session.getBranch?.() ?? session.getEntries();
+  return entries.flatMap(entry => {
+    if (!isObj(entry) || entry.type !== "message" || !isObj(entry.message)) return [];
+    return entry.message.role === "toolResult" && typeof entry.message.toolName === "string" ? [entry.message.toolName] : [];
+  });
+}
+export function resolveToolEvidence(reference: string, sessionManager: EvidenceSessionManager | undefined, aliases: Readonly<Record<string, readonly string[]>> = {}): boolean {
+  const match = /^tool:([A-Za-z0-9_-]+)(?:#(\d+))?$/i.exec(reference.trim());
+  if (!match || !sessionManager) return false;
+  let name = match[1];
+  const names = sessionResultNames(sessionManager);
+  if (!names.includes(name) && aliases[name]) {
+    const targets = [...new Set(aliases[name])];
+    if (targets.length !== 1) return false;
+    name = targets[0];
+  }
+  const count = names.filter(value => value === name).length;
+  if (!match[2]) return count > 0;
+  const index = Number(match[2]);
+  return index >= 1 && index <= count;
+}
+
+export function registerTaskManage(pi: { registerTool(tool: unknown): void; appendEntry(type: string, data: unknown): void; on(event: string, handler: (event: unknown, ctx: {sessionManager?: {getEntries(): readonly unknown[]; getBranch?(): readonly unknown[]}; ui?: {setWidget(key: string, content: unknown): void}})=>void): void }, presentation = taskManageRenderers, options: TaskManagerOptions = {}): TaskManager {
+  options = { ...options }; // Each registration owns its defaults and session closures.
+  const manager = new TaskManager(
+    entry => pi.appendEntry(entry.type, entry.data),
+    event => pi.appendEntry(event.type, event.data),
+    options,
+  );
+  let ui: {setWidget(key: string, content: unknown): void} | undefined;
+  let sessionManager: EvidenceSessionManager | undefined;
+  const refreshWidget = (ctx?: {ui?: {setWidget(key: string, content: unknown): void}}) => {
+    ui = ctx?.ui ?? ui;
+    if (!ui) return;
+    const tasks = manager.snapshot().tasks.filter(task => task.status !== "deleted");
+    const visible = tasks.some(task => task.status === "pending" || task.status === "in_progress");
+    ui.setWidget("swarm-tasks", visible
+      ? ((_tui: unknown, theme: RenderTheme) => taskWidgetRenderer(tasks, theme))
+      : undefined);
+  };
+  const bindSession = (_event: unknown, ctx: EvidenceContext) => {
+    sessionManager = ctx.sessionManager;
+    manager.rehydrate((ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries() ?? []) as JournalEntry[]);
+    refreshWidget(ctx);
+  };
+  pi.on("session_start", bindSession);
+  pi.on("session_switch", bindSession);
+  options.sessionEvidenceHints ??= () => {
+    const counts = new Map<string, number>();
+    for (const name of sessionResultNames(sessionManager)) {
+      if (/^[A-Za-z0-9_-]{1,64}$/.test(name)) counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return counts.size ? `; available: ${[...counts].slice(0, 8).map(([name, count]) => `tool:${name}#${count}`).join(", ")}` : "; no tool results on the current branch";
+  };
+  // Persist canonical names so later alias configuration cannot retarget saved answers.
+  options.canonicalizeToolEvidence ??= reference => {
+    const match = /^tool:([A-Za-z0-9_-]+)(#\d+)?$/i.exec(reference.trim());
+    if (!match || !sessionManager) return reference;
+    if (resolveToolEvidence(reference, sessionManager)) return reference;
+    const targets = [...new Set(options.toolAliases?.[match[1]] ?? [])];
+    if (targets.length !== 1 || !resolveToolEvidence(reference, sessionManager, options.toolAliases)) return reference;
+    return `tool:${targets[0]}${match[2] ?? ""}`;
+  };
+  // Intentionally exact-only here: supplied aliases are canonicalized above.
+  // Retained aliases have no historical mapping provenance; resolving them
+  // with today's alias map could silently retarget already-saved evidence.
+  options.resolveSessionEvidence ??= reference => resolveToolEvidence(reference, sessionManager);
+  pi.registerTool({ name:"TaskManage", label:"Manage tasks", description:"Manage ordered tasks. Optional compact questions {id,text}; Saved answers for unchanged questions are reused; supply missing or replacement {question,answer,evidence} answers. Completion revalidates all evidence. Evidence uses workspace file#heading, file#Lx-Ly, or tool:<ToolName>[#<n>] for a live tool result from this session. Keep detail in files. sequential commits the successful prefix; atomic commits all or rolls back.", parameters:taskManageSchema,
+    renderShell: "self",
+    promptSnippet: "TaskManage: track multi-step work with durable ordered tasks.",
+    promptGuidelines: ["Use TaskManage for multi-step work; keep exactly one active task when working sequentially; before starting work set the selected task status=\"in_progress\" and active=true; after verifying a task's acceptance criteria, explicitly update it with status=\"completed\" and activate the next unblocked task."],
+    renderCall: presentation.renderCall,
+    renderResult: presentation.renderResult,
+    execute: async (_id:string, params:Params, signal?:AbortSignal, _onUpdate?: unknown, ctx?: {cwd?: string; ui?: {setWidget(key: string, content: unknown): void}}) => {
+      if (ctx?.cwd) options.workspaceRoot = ctx.cwd;
+      // registry_impl.go runs TaskManageTool.Validate before Execute and
+      // reports failures as a tool error, not a failed batch.
+      const normalizedParams = normalizeTaskManageParams(params) as Params;
+      const invalid = swarmValidateTaskManageParams(normalizedParams);
+      if (invalid !== undefined) {
+        // Go reports pre-execution validation as a tool error rather than a
+        // failed batch, and the thrown string is wire-visible, so it is kept
+        // byte-identical. The structured details are additive: without them a
+        // multi-operation call reports a single string and the caller cannot
+        // tell which operation was rejected or whether anything ran.
+        const offending = /^operation "([^"]+)"/.exec(invalid)?.[1]
+          ?? /^duplicate operation key "([^"]+)"/.exec(invalid)?.[1];
+        const error = new Error(`Error executing TaskManage: validation failed for TaskManage: ${invalid} (error_id=err_${randomBytes(10).toString("hex")})`);
+        // An unparseable params object normalizes to undefined; the validation
+        // message above is still the primary payload, so never crash the error
+        // path while decorating it with per-operation details.
+        const operations = (normalizedParams as Params | undefined)?.operations;
+        Object.assign(error, { details: { batch: { status: "failed", results: (Array.isArray(operations) ? operations : []).map((operation, index) => {
+          const key = typeof operation?.key === "string" ? operation.key : String(index);
+          const isOffender = offending === undefined ? index === 0 : key === offending;
+          return { key, op: operation?.op, status: isOffender ? "failed" : "skipped", ...(isOffender ? { error: { code: "validation_failed", message: invalid, retryable: false } } : {}) };
+        }) ?? [] } } });
+        throw error;
+      }
+      const batch = manager.execute(normalizedParams,signal);
+      refreshWidget(ctx);
+      const ordered = goMapOrdered(batch);
+      return {
+        content:[{type:"text",text:JSON.stringify(ordered)}],
+        details:{batch:ordered},
+        isError:batch.status !== "succeeded",
+      };
+    } });
+  return manager;
+}
