@@ -1,0 +1,202 @@
+<div align="center">
+
+<img src="assets/hoja.svg" width="72" height="72" alt="Hoja">
+
+# Hoja for Codex
+
+**Tasks that can't be marked done without proof.**
+Trebol's TaskManage, its task-enforcement gate and Hoja issue sync — as a Codex plugin.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-2F855A.svg)](LICENSE)
+[![Codex plugin](https://img.shields.io/badge/Codex-plugin-111111.svg)](https://developers.openai.com/codex/plugins)
+[![Tests](https://img.shields.io/badge/tests-344%20passing-2F855A.svg)](#verify-it-yourself)
+[![Claude Code version](https://img.shields.io/badge/also%20for-Claude%20Code-D97757.svg)](https://github.com/hoja-work/hoja-claude-plugin)
+
+</div>
+
+---
+
+Agents say "done" too easily. Hoja makes "done" mean something:
+
+- **Every task has acceptance questions.** "Do the tests pass?" "Is the README updated?" — written up front.
+- **Completion needs evidence that resolves.** Each answer cites `src/app.ts#L10-L40`, `README.md#Install`, or
+  `tool:Bash#3` — a real file or a real tool result from *this* session, read from the Codex rollout. Made-up
+  evidence is rejected.
+- **Nothing mutates without a task.** A gate blocks shell writes, `apply_patch` and write-capable MCP tools until a
+  task is focused. Reads are always free.
+- **Your tracker stays current by itself.** With Hoja mode on, each top-level task becomes a Hoja issue, its
+  progress is rewritten in place, and an evidenced completion moves it to Done.
+
+This is not a re-implementation. The engine, the gate and Hoja mode are
+[Trebol](https://github.com/cloverinternational/trebol)'s own code, vendored byte-for-byte and hash-checked. The
+plugin only translates between Codex's hooks and Trebol's runtime.
+
+## Quick start
+
+```bash
+codex plugin marketplace add hoja-work/hoja-codex-plugin
+codex plugin add hoja@hoja
+```
+
+Then three one-time steps:
+
+1. **Credentials (optional).** Export them in the shell that starts Codex. The plugin forwards only the variables
+   listed in [Configuration](#configuration).
+   ```bash
+   export HOJA_API_URL=https://hoja.example.com/graphql HOJA_TOKEN=… HOJA_PROJECT="My Project"
+   ```
+2. **Trust the hooks.** Codex runs plugin hooks only after you review them: open `/hooks` in the TUI and trust the
+   **hoja** hooks.
+3. **Let the tools run.** Codex asks before each MCP tool call by default. To skip that for Hoja's tools, add this
+   to `~/.codex/config.toml`:
+   ```toml
+   [plugins."hoja@hoja".mcp_servers.hoja]
+   default_tools_approval_mode = "approve"
+
+   [plugins."hoja@hoja".mcp_servers.hoja_api]
+   default_tools_approval_mode = "approve"
+   ```
+
+Then work as usual, and type `hoja:setup` to check everything.
+
+## What you get
+
+| | |
+| --- | --- |
+| **`TaskManage`** | Ordered, durable tasks with dependencies, sub-tasks, notes and 1–12 acceptance questions each. Completion is validated against the workspace and the Codex rollout. |
+| **Task gate** | Trebol's Swarm hook pipeline: blocks non-read-only tools without a focused task (`block`), or only nudges (`advise`). Also: the completion nudge, the task-maintenance nudge, the bare-`sleep` blocker and the stdin-conflict guard. |
+| **Auto-continue** | When a gate block ends the turn, the `Stop` hook sends Codex back with exactly what to do, within the same bounded budget Trebol uses. |
+| **Hoja mode** | `hoja_list`, `hoja_get` and `hoja_project`, plus automatic publication: one Hoja issue per coarse task, acceptance questions in the description, an evidence comment and Done on completion. |
+| **Hosted Hoja API** | The workspace's full MCP API (70+ tools: issues, comments, decisions, projects, cycles) as a second server, `hoja_api`. It is gated and evidence-checked under the same names Trebol uses. |
+| **Prompt commands** | `hoja:tasks`, `hoja:hoja on\|off\|status` and `hoja:setup`, typed as the whole prompt. All are answered locally, with no model turn. Omit the slash: the Codex TUI rejects unknown `/` commands. |
+| **Skill** | `skills/hoja` teaches the create → focus → evidence workflow. |
+
+## Configuration
+
+Codex has no plugin settings UI, so configuration comes from the environment. The servers receive only these
+variables (`env_vars` in [`.mcp.json`](.mcp.json)):
+
+| Variable | Purpose |
+| --- | --- |
+| `HOJA_API_URL` (deprecated alias: `LINEAR_API_URL`) | Hoja GraphQL endpoint, e.g. `https://hoja.example.com/graphql` |
+| `HOJA_MCP_URL` | Hosted MCP endpoint. Derived from the GraphQL host when unset |
+| `HOJA_TOKEN` (deprecated alias: `LINEAR_TOKEN`) | Personal API token |
+| `HOJA_PROJECT` | Default project for publication. Also `.pi/config/hoja.json` in the repo |
+| `HOJA_TASK_ENFORCEMENT` | `block` (default) · `advise` · `off` |
+| `HOJA_PLUGIN_HEADLESS=1` | Use Trebol's headless (`swarm -p`) prompt semantics, e.g. for `codex exec` |
+| `HOJA_PLUGIN_DISABLE_HOJA=1` | Turn Hoja mode off entirely; TaskManage and the gate still run |
+| `HOJA_DEBUG_LOG=/path` | Append every hook and tool call the server receives |
+
+Like Trebol, there is **no default endpoint**: Hoja calls fail closed with a message naming the variable to set.
+Without credentials, TaskManage and the gate still work and publication is skipped.
+
+## How it works
+
+Codex's hook model matches Claude Code's closely, including `mcp_tool` hooks that call a tool on an
+already-connected MCP server. One server process per session holds the task state, the gate and the Hoja client.
+It serves the tools *and* receives every hook event, so they share memory — exactly as they do inside Trebol's Pi
+runtime.
+
+```mermaid
+flowchart LR
+  subgraph client["Codex"]
+    U(["You"])
+    M["Model"]
+    H["Hook events"]
+  end
+  subgraph plugin["hoja plugin (Node, stdio)"]
+    SS["session-start.mjs<br/>(command hook)"]
+    S[["server.mjs<br/>TaskManage · hoja_* · __hoja_hook"]]
+    V["vendor/trebol<br/>engine · gate · hoja-mode"]
+    P["api-proxy.mjs<br/>(hoja_api)"]
+    J[("PLUGIN_DATA<br/>sessions/*.jsonl")]
+    R[("Codex rollout<br/>sessions/…/rollout-*.jsonl")]
+  end
+  subgraph ext["Hoja workspace"]
+    G["GraphQL API"]
+    X["Hosted MCP API"]
+  end
+  U --> M
+  M -->|tool calls| S
+  M -->|tool calls| P
+  H -->|mcp_tool hooks| S
+  SS -->|developer context| M
+  S --> V
+  S --> J
+  S -->|reads evidence| R
+  V -.->|HTTPS publish| G
+  P -->|HTTPS + Bearer| X
+```
+
+### Trebol → Codex mapping
+
+| Trebol (Pi runtime) | Codex |
+| --- | --- |
+| `registerTool` (TaskManage, hoja_*) | MCP stdio server `hoja` (`mcp__hoja__TaskManage`, …) |
+| `tool_call` block / pre-context | `PreToolUse` → `permissionDecision: "deny"` / `additionalContext` |
+| `tool_result` | `PostToolUse` |
+| `turn_end` (once per tool batch) | The `PostToolUse` that settles the last in-flight call (Codex has no `PostToolBatch`) |
+| `before_agent_start` system prompt | `SessionStart` command hook |
+| `agent_before_settle` gate resume | `Stop` → `decision: "block"`; Codex turns the reason into the continuation prompt |
+| `/tasks`, `/hoja` | `hoja:tasks`, `hoja:hoja`, matched in `UserPromptSubmit` and blocked locally (Codex has no `UserPromptExpansion`) |
+| Pi session messages | The Codex rollout. `exec_command` / `shell` count as `Bash`; MCP calls become `namespace__name` |
+| Session entries | `$CODEX_HOME/plugins/data/hoja-hoja/sessions/<id>.jsonl` |
+
+Codex gives hooks `PLUGIN_DATA` but not MCP servers, so the server derives the same directory from its install path.
+Both always agree.
+
+### Known Codex limits
+
+- Plugin hooks need a one-time trust review (`/hooks`). Until you do it, tools work but the gate does not run.
+- Codex documents tool hooks as "a useful guardrail, not a complete enforcement boundary". Hosted tools such as
+  `WebSearch` don't go through hooks.
+- Per Codex's docs, plugins that bundle lifecycle hooks can't be listed in the public plugin directory. Install
+  this one from its marketplace as shown above.
+
+## Verify it yourself
+
+```bash
+git clone https://github.com/hoja-work/hoja-codex-plugin && cd hoja-codex-plugin
+npm ci
+npm run vendor:check   # 53 vendored files match vendor/MANIFEST.json (SHA-256)
+npm test               # Trebol's own 25 suites, unmodified, plus the adapter tests: 344 tests
+npm run install:local  # codex plugin marketplace add . && codex plugin add hoja@hoja
+```
+
+Then a live check:
+
+```bash
+codex exec --skip-git-repo-check -s workspace-write "Run: touch proof.txt . If a hook blocks it, follow its instructions, then retry."
+```
+
+You should see the block, a `TaskManage` create and focus, the retried command, and an evidenced completion.
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| Nothing is ever blocked | The hooks are not trusted yet. Open `/hooks`. Set `HOJA_DEBUG_LOG` to see whether `__hoja_hook` calls arrive. |
+| `MCP tool call requires approval` in `codex exec` | Add the `default_tools_approval_mode = "approve"` config from [Quick start](#quick-start). |
+| `Unrecognized command '/hoja:setup'` | Type `hoja:setup` without the slash. |
+| `hoja_api` serves no tools | No endpoint or token reached the server. Export the variables before starting Codex. |
+| Tasks are not published | Run `hoja:hoja status` and `hoja:setup`. Publication needs a token and a resolvable project. |
+
+## Development
+
+```text
+src/            adapter (same source as the Claude Code plugin; HOJA_PLUGIN_HOST=codex selects Codex names and wire shapes)
+vendor/trebol/  Trebol files, byte-for-byte (never edit; re-vendor instead)
+dist/           bundled entry points (committed, because plugins run without a build step)
+.codex-plugin/  plugin manifest
+.mcp.json       the hoja and hoja_api servers
+hooks/          hooks.json — every event is forwarded to the server's __hoja_hook tool
+skills/hoja/    workflow skill
+.agents/plugins/marketplace.json   makes this repo installable with `codex plugin marketplace add`
+```
+
+To re-vendor from a Trebol checkout, run `TREBOL_ROOT=~/src/trebol npm run vendor && npm run build && npm test`.
+
+## License
+
+[MIT](LICENSE). `vendor/trebol/` is unmodified code from
+[cloverinternational/trebol](https://github.com/cloverinternational/trebol). See [NOTICE](NOTICE).
