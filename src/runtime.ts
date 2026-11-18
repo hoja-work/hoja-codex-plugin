@@ -15,6 +15,7 @@ import { canonicalToolName } from "./transcript.ts";
 import { PiShim, type ShimOptions } from "./pi-shim.ts";
 import { HookBridge, type BridgeOptions } from "./hook-bridge.ts";
 import { resolveMcpUrl, UpstreamMcp } from "./api-proxy.ts";
+import { wrapHojaWriter } from "./hoja-writer.ts";
 
 export const TASK_MANAGER_SYMBOL = Symbol.for("pi-swarm-task-manager");
 
@@ -46,18 +47,35 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 	registerTaskHooks(shim.api as any, manager, { enforcementMode: "off", silent: true });
 	// /tasks: Pi opens a read-only TUI browser; Claude Code shows the same widget as text.
 	shim.api.registerCommand("tasks", { description: "Show the read-only task board", handler: () => taskBoard(manager) });
-	if (options.hoja !== false) registerHojaMode(shim.api, (options.hojaClient ?? new HojaClient()) as any);
+	// Publication goes through the same client Trebol's hoja-mode uses; the wrapper only adds what Trebol's
+	// createIssue cannot express (the task's description and priority). See src/hoja-writer.ts.
+	if (options.hoja !== false) {
+		const client = (options.hojaClient ?? new HojaClient()) as object;
+		registerHojaMode(shim.api, wrapHojaWriter(client, () => manager.snapshot().tasks, options.log) as any);
+	}
+	// One report behind both entry points: the /setup command (answered by the hook, no model turn) and the
+	// `hoja_setup` tool, which is the fallback when that hook could not run.
+	const setupReport = async (ctx: any = shim.ctx()): Promise<string> => {
+		const hoja = shim.commands.get("hoja");
+		const before = shim.notifications.length;
+		if (hoja) await hoja.handler("status", ctx);
+		const mode = shim.notifications.slice(before).map(n => n.message).join(" ");
+		shim.notifications.length = before;
+		return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...(await hojaDoctor()), mode && `Hoja mode: ${mode}`].filter(Boolean).join("\n");
+	};
 	// Claude-only: one place to see why Hoja is or isn't working (credential sources, both endpoints, mode, gate).
 	shim.api.registerCommand("setup", {
 		description: "Check Hoja credentials, endpoints, project and task enforcement",
-		handler: async (_args: string, ctx: any) => {
-			const hoja = shim.commands.get("hoja");
-			const before = shim.notifications.length;
-			if (hoja) await hoja.handler("status", ctx);
-			const mode = shim.notifications.slice(before).map(n => n.message).join(" ");
-			shim.notifications.length = before;
-			return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...(await hojaDoctor()), mode && `Hoja mode: ${mode}`].filter(Boolean).join("\n");
-		},
+		handler: (_args: string, ctx: any) => setupReport(ctx),
+	});
+	// Read-only fallback for the same report. Claude Code fails a hook open when its MCP server is not connected, so
+	// commands/*.md tells the model to call this instead of guessing why the command reached it.
+	shim.api.registerTool({
+		name: "hoja_setup", label: "Hoja setup check",
+		description: "Read-only health check for this plugin: task enforcement mode, Hoja credential sources, the GraphQL endpoint and the hosted MCP endpoint, Hoja mode for this chat and the task board. Prints the same report as /hoja:setup. Call it when /hoja:setup did not answer locally, and show its output verbatim.",
+		parameters: { type: "object", properties: {}, additionalProperties: false },
+		execute: async (_id: string, _params: unknown, _signal?: AbortSignal, _onUpdate?: unknown, ctx?: any) =>
+			({ content: [{ type: "text", text: await setupReport(ctx ?? shim.ctx()) }], details: {} }),
 	});
 	return { shim, manager, bridge };
 }

@@ -1,7 +1,7 @@
 {
   "name": "hoja",
-  "version": "0.3.0",
-  "description": "Trebol's TaskManage (acceptance questions + evidence-validated completion), its Swarm task-enforcement hooks and Hoja mode (automatic TaskManage \u2192 Hoja issue publication), plus the hosted Hoja API tools \u2014 ported 1:1 to Codex.",
+  "version": "0.3.1",
+  "description": "Trebol's TaskManage (acceptance questions + evidence-validated completion), its Swarm task-enforcement hooks and Hoja mode (automatic TaskManage → Hoja issue publication), plus the hosted Hoja API tools — ported 1:1 to Codex.",
   "author": {
     "name": "Hoja",
     "url": "https://github.com/hoja-work"

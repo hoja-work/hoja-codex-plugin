@@ -31,3 +31,8 @@ Type these as the whole prompt. They are answered locally, with no model turn (t
 | `hoja:tasks` | Show the read-only task board |
 | `hoja:hoja on` · `hoja:hoja off` · `hoja:hoja status` | Toggle or inspect Hoja mode for this chat |
 | `hoja:setup` | Check credentials, both Hoja endpoints, the project and the enforcement mode |
+
+If a prompt command comes back as instructions instead of an answer, the hook could not reach the plugin server. Then
+call the read-only `hoja_setup` tool and show its output — it prints the same report as `hoja:setup`. Read-only
+discovery is never gated: `hoja_project action:list`, `hoja_viewer`, `hoja_teams` and the other hosted API reads pass
+without a task, so a health check never needs an issue.

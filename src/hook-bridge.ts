@@ -29,6 +29,7 @@ import { STDIN_CONFLICT_HOOK_NAME, StdinConflictHook } from "../vendor/trebol/.p
 import { TaskGateResumeBudget, evaluateTaskGateResume } from "../vendor/trebol/.pi/lib/runtime/task-gate-resume.ts";
 import type { TaskManager } from "../vendor/trebol/packages/tools/taskmanage/src/task-manage.ts";
 import { canonicalToolName, isOwnTool, type PiMessage } from "./transcript.ts";
+import { bashReadOnlyCommand, isAdapterReadOnlyTool, localCommandOf, normalizeCommandName } from "./host-policy.ts";
 import { hostOf, type Host } from "./host.ts";
 import type { PiShim } from "./pi-shim.ts";
 
@@ -42,9 +43,6 @@ export interface BridgeOptions {
 	/** Which host's hook wire shapes to speak; defaults to HOJA_PLUGIN_HOST. */
 	host?: Host;
 }
-
-/** `hoja:tasks`, `hoja:hoja on` — how a Codex user invokes a registered command (the Codex TUI rejects unknown `/` commands). */
-const LOCAL_COMMAND = /^\s*\/?hoja:([a-z][\w-]*)(?:\s+([\s\S]*))?$/i;
 
 export type HookPayload = Record<string, any>;
 export type HookOutput = Record<string, unknown>;
@@ -160,10 +158,11 @@ export class HookBridge {
 		const session = this.shim.sessionId || "session";
 		const prompt = typeof payload.prompt === "string" ? payload.prompt : "";
 		this.inFlight.clear();
-		if (this.host === "codex") {
-			const match = LOCAL_COMMAND.exec(prompt);
-			if (match && this.shim.commands.has(match[1].toLowerCase())) return this.command({ command_name: match[1].toLowerCase(), command_args: match[2]?.trim() ?? "" });
-		}
+		// A registered command answered here as well as in UserPromptExpansion. Codex has no UserPromptExpansion at all
+		// (its TUI rejects unknown `/` commands), and Claude Code fails open when the expansion hook cannot run — either
+		// way the command's fallback .md body must never become the model's job. Same output, same block shape.
+		const local = localCommandOf(prompt);
+		if (local && this.shim.commands.has(local.name)) return this.command({ command_name: local.name, command_args: local.args });
 		// A real user turn is outside intervention and refills the gate auto-continue budget.
 		this.gateResume.reset(session);
 		await this.shim.emit("input", { text: prompt, source: this.headless ? "rpc" : "interactive" });
@@ -189,7 +188,16 @@ export class HookBridge {
 		if (isOwnTool(raw) && toolCallId) this.pendingToolCallIds.set(toolName, [...(this.pendingToolCallIds.get(toolName) ?? []), toolCallId]);
 		await this.shim.emit("tool_call", { toolName, toolCallId, input: params });
 		if (HOST_SCHEMA_LOADERS.has(toolName)) return {};
-		const { block, context: pre } = this.pipeline.preTool({ toolName, params, toolCallId });
+		// Read-only discovery (hosted Hoja API reads, hoja_project list, hoja_setup) is exempt in the adapter: Trebol's
+		// classifier only knows its own runtime's read tools, and gating these made a health check impossible without
+		// filing an issue. The exemption is a skip of the whole pre-tool chain, like Trebol's own read-only branch.
+		if (isAdapterReadOnlyTool(toolName, params)) { this.inFlight.add(toolCallId ?? `anon-${this.inFlight.size}`); return {}; }
+		// Bash: pure file-descriptor redirections (`2>&1`, `>/dev/null`) are stripped before classification because
+		// Trebol's tokenizer reads the `&` in `2>&1` as a command separator. Nothing executable changes.
+		const policy = toolName === "Bash" && typeof (params as any)?.command === "string"
+			? { ...params, command: bashReadOnlyCommand((params as any).command) }
+			: params;
+		const { block, context: pre } = this.pipeline.preTool({ toolName, params: policy, toolCallId });
 		if (block) {
 			if (isOwnTool(raw)) this.takeToolCallId(toolName);
 			return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: block } };
@@ -240,7 +248,8 @@ export class HookBridge {
 	}
 
 	private async command(payload: HookPayload): Promise<HookOutput> {
-		const name = String(payload.command_name ?? "").replace(/^hoja:/, "");
+		// `setup`, `hoja:setup`, `/hoja:setup`, `plugin:hoja:setup` all name the same registered command.
+		const name = normalizeCommandName(payload.command_name ?? payload.name);
 		const command = this.shim.commands.get(name);
 		if (!command) return {};
 		const before = this.shim.notifications.length;

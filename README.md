@@ -9,7 +9,7 @@ Trebol's TaskManage, its task-enforcement gate and Hoja issue sync — as a Code
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2F855A.svg)](LICENSE)
 [![Codex plugin](https://img.shields.io/badge/Codex-plugin-111111.svg)](https://developers.openai.com/codex/plugins)
-[![Tests](https://img.shields.io/badge/tests-344%20passing-2F855A.svg)](#verify-it-yourself)
+[![Tests](https://img.shields.io/badge/tests-355%20passing-2F855A.svg)](#verify-it-yourself)
 [![Claude Code version](https://img.shields.io/badge/also%20for-Claude%20Code-D97757.svg)](https://github.com/hoja-work/hoja-claude-plugin)
 
 </div>
@@ -67,8 +67,8 @@ Then work as usual, and type `hoja:setup` to check everything.
 | **Task gate** | Trebol's Swarm hook pipeline: blocks non-read-only tools without a focused task (`block`), or only nudges (`advise`). Also: the completion nudge, the task-maintenance nudge, the bare-`sleep` blocker and the stdin-conflict guard. |
 | **Auto-continue** | When a gate block ends the turn, the `Stop` hook sends Codex back with exactly what to do, within the same bounded budget Trebol uses. |
 | **Hoja mode** | `hoja_list`, `hoja_get` and `hoja_project`, plus automatic publication: one Hoja issue per coarse task, acceptance questions in the description, an evidence comment and Done on completion. |
-| **Hosted Hoja API** | The workspace's full MCP API (70+ tools: issues, comments, decisions, projects, cycles) as a second server, `hoja_api`. It is gated and evidence-checked under the same names Trebol uses. |
-| **Prompt commands** | `hoja:tasks`, `hoja:hoja on\|off\|status` and `hoja:setup`, typed as the whole prompt. All are answered locally, with no model turn. Omit the slash: the Codex TUI rejects unknown `/` commands. |
+| **Hosted Hoja API** | The workspace's full MCP API (70+ tools: issues, comments, decisions, projects, cycles) as a second server, `hoja_api`. Its **read** tools are exempt from the gate (see [Deviations from Trebol](#deviations-from-trebol)); its writes are gated and evidence-checked under the same names Trebol uses. |
+| **Prompt commands** | `hoja:tasks`, `hoja:hoja on\|off\|status` and `hoja:setup`, typed as the whole prompt. All are answered locally, with no model turn — and `hoja_setup`, the same read-only report as a tool, is the fallback when the prompt hook cannot run. Omit the slash: the Codex TUI rejects unknown `/` commands. |
 | **Skill** | `skills/hoja` teaches the create → focus → evidence workflow. |
 
 ## Configuration
@@ -159,7 +159,7 @@ Both always agree.
 git clone https://github.com/hoja-work/hoja-codex-plugin && cd hoja-codex-plugin
 npm ci
 npm run vendor:check   # 53 vendored files match vendor/MANIFEST.json (SHA-256)
-npm test               # Trebol's own 25 suites, unmodified, plus the adapter tests: 344 tests
+npm test               # Trebol's own 25 suites, unmodified, plus the adapter tests: 355 tests
 npm run install:local  # codex plugin marketplace add . && codex plugin add hoja@hoja
 ```
 
@@ -180,6 +180,20 @@ You should see the block, a `TaskManage` create and focus, the retried command, 
 | `Unrecognized command '/hoja:setup'` | Type `hoja:setup` without the slash. |
 | `hoja_api` serves no tools | No endpoint or token reached the server. Export the variables before starting Codex. |
 | Tasks are not published | Run `hoja:hoja status` and `hoja:setup`. Publication needs a token and a resolvable project. |
+| A read-only tool was refused by the gate | Read tools of the hosted API and `hoja_project action:list` are exempt. A tool that is not on that list (or a shell command Trebol's allowlist does not know) is gated by design — set `HOJA_TASK_ENFORCEMENT=advise`, or use plain `ls`/`cat`/`grep`/`git log` forms. |
+
+## Deviations from Trebol
+
+The vendored code decides everything; the adapter only widens or re-routes four things a host does differently. Each
+one is covered by a test in `test/reported-bugs.test.ts`.
+
+| Area | Trebol | Here | Why |
+| --- | --- | --- | --- |
+| Schema loading | — | `ToolSearch` is never gated (Claude Code only) | Claude Code defers MCP tools behind `ToolSearch`; gating it could make the gate's only exit (TaskManage) unreachable. |
+| Read-only discovery | its own read tools (`hoja_list`, `hoja_get`, context, history, vault list/get) | also the hosted Hoja API's read tools (`hoja_viewer`, `hoja_workspace`, `hoja_teams`, `hoja_issues`, `hoja_projects`, `hoja_cycles`, `hoja_workflowStates`, `hoja_*Decisions`, inbox, labels, `hoja_extensionActions`, …), `hoja_project action:list` and `hoja_setup` | Trebol never sees the hosted API, so the gate refused a health check until an issue was filed. Writes (`hoja_issueCreate`, `hoja_taskUpdate`, `hoja_commentCreate`, `hoja_extensionActionRun`, `hoja_notificationMarkRead`, every `*Answer`/`*Update`/`*Delete`) stay gated. |
+| Read-only Bash | `isBashReadOnly` over its tokenizer | the same call after dropping pure file-descriptor redirections (`2>&1`, `>&2`, `>/dev/null`, `&>/dev/null`) | Trebol's tokenizer reads the `&` in `2>&1` as a command separator, so `cat file 2>&1` looked like two commands. Redirects to real files are untouched, and Trebol's allowlist stays conservative (`|| true` is still not read-only). |
+| Prompt commands | `hoja:tasks`, `hoja:hoja` are Pi commands | matched in `UserPromptSubmit` (Codex has no `UserPromptExpansion`), with any spelling of the command name, plus the `hoja_setup` tool | A hook that cannot reach the plugin server fails open; the command text then reached the model. |
+| Published issue content | `createIssue(title, description)` — no priority | the task's description is put at the head of the issue body when the create operation omitted it, and its priority is written with one `issueUpdate` after the create | `IssueCreateInput.priority` was never populated, so every issue kept Hoja's default. Only the create path is touched: Trebol's later description writes are proved by exact read-back, so a description added to a task *after* its issue exists still stays local (upstream behaviour). |
 
 ## Development
 

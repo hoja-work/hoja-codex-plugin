@@ -5158,8 +5158,69 @@ function evaluateTaskGateResume(input2) {
   };
 }
 
-// src/hook-bridge.ts
+// src/host-policy.ts
+var bare = (name) => name.replace(/^mcp__[A-Za-z0-9_-]+__/, "");
+var policyName = (name) => bare(name).replace(/_/g, "").toLowerCase();
+var READ_ONLY_HOST_TOOLS = [
+  // this plugin's own tools (Trebol already allows hoja_list/hoja_get; hoja_project is action-gated below)
+  "hoja_list",
+  "hoja_get",
+  "hoja_setup",
+  // identity, workspace, teams
+  "hoja_viewer",
+  "hoja_workspace",
+  "hoja_organizationMembers",
+  "hoja_teams",
+  "hoja_team",
+  // issues and tasks
+  "hoja_issues",
+  "hoja_issue",
+  "hoja_searchIssues",
+  "hoja_myIssueActivity",
+  "hoja_tasks",
+  "hoja_task",
+  "hoja_searchTasks",
+  "hoja_myTaskActivity",
+  // projects, initiatives, cycles, workflow states, labels
+  "hoja_projects",
+  "hoja_projectUpdates",
+  "hoja_initiatives",
+  "hoja_initiative",
+  "hoja_cycles",
+  "hoja_cycle",
+  "hoja_teamCycleCadence",
+  "hoja_workflowStates",
+  "hoja_issueLabels",
+  "hoja_taskLabels",
+  // decisions (read) and inbox
+  "hoja_issueDecisions",
+  "hoja_issueDecision",
+  "hoja_taskDecisions",
+  "hoja_taskDecision",
+  "hoja_inboxNotifications",
+  "hoja_inboxUnreadCount",
+  // extension action catalogue (running one is hoja_extensionActionRun and stays gated)
+  "hoja_extensionActions"
+];
+var READ_ONLY_HOST = new Set(READ_ONLY_HOST_TOOLS.map(policyName));
+var isAdapterReadOnlyTool = (toolName2, params) => {
+  const name = policyName(toolName2);
+  if (name === "hojaproject") {
+    const action = params?.action;
+    return action == null || action === "list";
+  }
+  return READ_ONLY_HOST.has(name);
+};
+var stripFdRedirections = (command) => command.replace(/(?:^|(?<=[\s;|&]))(\d*|&)>>?\s*&(?:(\d+)|-)/g, " ").replace(/(?:^|(?<=[\s;|&]))(\d*|&)>>?\s*\/dev\/null/g, " ").replace(/[ \t]{2,}/g, " ").trim();
+var bashReadOnlyCommand = (command) => stripFdRedirections(command).trim().replace(/\s+$/, "");
+var normalizeCommandName = (raw) => String(raw ?? "").trim().toLowerCase().replace(/^\//, "").replace(/^plugin:[a-z0-9_-]+:/, "").replace(/^[a-z0-9_-]+:/, "");
 var LOCAL_COMMAND = /^\s*\/?hoja:([a-z][\w-]*)(?:\s+([\s\S]*))?$/i;
+var localCommandOf = (prompt) => {
+  const match = LOCAL_COMMAND.exec(prompt);
+  return match ? { name: match[1].toLowerCase(), args: match[2]?.trim() ?? "" } : void 0;
+};
+
+// src/hook-bridge.ts
 var HOST_SCHEMA_LOADERS = /* @__PURE__ */ new Set(["ToolSearch"]);
 var parse = (value) => {
   if (typeof value !== "string") return value;
@@ -5287,10 +5348,8 @@ var HookBridge = class {
     const session = this.shim.sessionId || "session";
     const prompt = typeof payload.prompt === "string" ? payload.prompt : "";
     this.inFlight.clear();
-    if (this.host === "codex") {
-      const match = LOCAL_COMMAND.exec(prompt);
-      if (match && this.shim.commands.has(match[1].toLowerCase())) return this.command({ command_name: match[1].toLowerCase(), command_args: match[2]?.trim() ?? "" });
-    }
+    const local = localCommandOf(prompt);
+    if (local && this.shim.commands.has(local.name)) return this.command({ command_name: local.name, command_args: local.args });
     this.gateResume.reset(session);
     await this.shim.emit("input", { text: prompt, source: this.headless ? "rpc" : "interactive" });
     await this.shim.emit("before_agent_start", { prompt, systemPrompt: "" });
@@ -5314,7 +5373,12 @@ var HookBridge = class {
     if (isOwnTool(raw) && toolCallId) this.pendingToolCallIds.set(toolName2, [...this.pendingToolCallIds.get(toolName2) ?? [], toolCallId]);
     await this.shim.emit("tool_call", { toolName: toolName2, toolCallId, input: params });
     if (HOST_SCHEMA_LOADERS.has(toolName2)) return {};
-    const { block, context: pre } = this.pipeline.preTool({ toolName: toolName2, params, toolCallId });
+    if (isAdapterReadOnlyTool(toolName2, params)) {
+      this.inFlight.add(toolCallId ?? `anon-${this.inFlight.size}`);
+      return {};
+    }
+    const policy = toolName2 === "Bash" && typeof params?.command === "string" ? { ...params, command: bashReadOnlyCommand(params.command) } : params;
+    const { block, context: pre } = this.pipeline.preTool({ toolName: toolName2, params: policy, toolCallId });
     if (block) {
       if (isOwnTool(raw)) this.takeToolCallId(toolName2);
       return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: block } };
@@ -5356,7 +5420,7 @@ var HookBridge = class {
     return {};
   }
   async command(payload) {
-    const name = String(payload.command_name ?? "").replace(/^hoja:/, "");
+    const name = normalizeCommandName(payload.command_name ?? payload.name);
     const command = this.shim.commands.get(name);
     if (!command) return {};
     const before = this.shim.notifications.length;
@@ -5559,6 +5623,62 @@ function main() {
 }
 if (process.argv[1] && /api-proxy\.(m?js|ts)$/.test(process.argv[1])) main();
 
+// src/hoja-writer.ts
+var TRACKED_BY = /Tracked by TaskManage task #([^\s]+) in session/;
+var LINK_MARKER = /Link marker: hoja-task:[^:\s]+:([A-Za-z0-9_-]+)/;
+var taskIdOfDescription = (description) => TRACKED_BY.exec(description)?.[1] ?? LINK_MARKER.exec(description)?.[1];
+var PRIORITY_VALUES = { urgent: 1, high: 2, medium: 3, low: 4 };
+var priorityValue = (priority) => typeof priority === "string" ? PRIORITY_VALUES[priority.trim().toLowerCase()] : void 0;
+var withTaskDescription = (description, taskDescription) => {
+  const body = (taskDescription ?? "").trim();
+  if (!body || description.includes(body)) return description;
+  return `${body}
+
+${description}`;
+};
+var PRIORITY_MUTATION = `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`;
+async function writePriority(client, issueId, priority, log) {
+  const c = client;
+  if (!issueId || typeof issueId !== "string" || priority === void 0 || typeof c?.gql !== "function") return false;
+  try {
+    const data = await c.gql(PRIORITY_MUTATION, { id: issueId, input: { priority } });
+    if (!data?.issueUpdate?.success) {
+      log?.(`priority ${priority} for ${issueId} was not confirmed`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    log?.(`priority ${priority} for ${issueId} failed: ${error.message}`);
+    return false;
+  }
+}
+function wrapHojaWriter(client, tasks, log) {
+  if (!client || typeof client.createIssue !== "function") return client;
+  const taskFor = (description) => {
+    const id = taskIdOfDescription(String(description ?? ""));
+    if (!id) return void 0;
+    try {
+      return tasks().find((task) => String(task?.id) === id);
+    } catch {
+      return void 0;
+    }
+  };
+  const createIssue = async (resolved, title, description, state, options) => {
+    const task = taskFor(description);
+    const body = withTaskDescription(String(description ?? ""), typeof task?.description === "string" ? task.description : void 0);
+    const created = await client.createIssue(resolved, title, body, state, options);
+    await writePriority(client, created?.id, priorityValue(task?.priority), log);
+    return created;
+  };
+  return new Proxy(client, {
+    get(target2, property) {
+      if (property === "createIssue") return createIssue;
+      const value = Reflect.get(target2, property, target2);
+      return typeof value === "function" ? value.bind(target2) : value;
+    }
+  });
+}
+
 // src/runtime.ts
 var TASK_MANAGER_SYMBOL = /* @__PURE__ */ Symbol.for("pi-swarm-task-manager");
 var alias = (name) => typeof name === "string" && canonicalToolName(name) !== name ? canonicalToolName(name) : void 0;
@@ -5576,17 +5696,28 @@ function createRuntime(options) {
   const bridge = new HookBridge(shim, manager, options);
   registerTaskHooks(shim.api, manager, { enforcementMode: "off", silent: true });
   shim.api.registerCommand("tasks", { description: "Show the read-only task board", handler: () => taskBoard(manager) });
-  if (options.hoja !== false) registerHojaMode(shim.api, options.hojaClient ?? new HojaClient());
+  if (options.hoja !== false) {
+    const client = options.hojaClient ?? new HojaClient();
+    registerHojaMode(shim.api, wrapHojaWriter(client, () => manager.snapshot().tasks, options.log));
+  }
+  const setupReport = async (ctx = shim.ctx()) => {
+    const hoja = shim.commands.get("hoja");
+    const before = shim.notifications.length;
+    if (hoja) await hoja.handler("status", ctx);
+    const mode = shim.notifications.slice(before).map((n) => n.message).join(" ");
+    shim.notifications.length = before;
+    return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...await hojaDoctor(), mode && `Hoja mode: ${mode}`].filter(Boolean).join("\n");
+  };
   shim.api.registerCommand("setup", {
     description: "Check Hoja credentials, endpoints, project and task enforcement",
-    handler: async (_args, ctx) => {
-      const hoja = shim.commands.get("hoja");
-      const before = shim.notifications.length;
-      if (hoja) await hoja.handler("status", ctx);
-      const mode = shim.notifications.slice(before).map((n) => n.message).join(" ");
-      shim.notifications.length = before;
-      return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...await hojaDoctor(), mode && `Hoja mode: ${mode}`].filter(Boolean).join("\n");
-    }
+    handler: (_args, ctx) => setupReport(ctx)
+  });
+  shim.api.registerTool({
+    name: "hoja_setup",
+    label: "Hoja setup check",
+    description: "Read-only health check for this plugin: task enforcement mode, Hoja credential sources, the GraphQL endpoint and the hosted MCP endpoint, Hoja mode for this chat and the task board. Prints the same report as /hoja:setup. Call it when /hoja:setup did not answer locally, and show its output verbatim.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute: async (_id, _params, _signal, _onUpdate, ctx) => ({ content: [{ type: "text", text: await setupReport(ctx ?? shim.ctx()) }], details: {} })
   });
   return { shim, manager, bridge };
 }
