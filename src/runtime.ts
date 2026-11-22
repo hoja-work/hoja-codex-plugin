@@ -15,6 +15,8 @@ import { canonicalToolName } from "./transcript.ts";
 import { PiShim, type ShimOptions } from "./pi-shim.ts";
 import { HookBridge, type BridgeOptions } from "./hook-bridge.ts";
 import { resolveMcpUrl, UpstreamMcp } from "./api-proxy.ts";
+import { authFetch, SIGN_IN_HINT } from "./credentials.ts";
+import { credentials } from "./env.ts";
 import { wrapHojaWriter } from "./hoja-writer.ts";
 
 export const TASK_MANAGER_SYMBOL = Symbol.for("pi-swarm-task-manager");
@@ -50,7 +52,7 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 	// Publication goes through the same client Trebol's hoja-mode uses; the wrapper only adds what Trebol's
 	// createIssue cannot express (the task's description and priority). See src/hoja-writer.ts.
 	if (options.hoja !== false) {
-		const client = (options.hojaClient ?? new HojaClient()) as object;
+		const client = (options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials) as any })) as object;
 		registerHojaMode(shim.api, wrapHojaWriter(client, () => manager.snapshot().tasks, options.log) as any);
 	}
 	// One report behind both entry points: the /setup command (answered by the hook, no model turn) and the
@@ -85,9 +87,12 @@ type Probe = (url: string, init: any) => Promise<{ status: number; headers: { ge
 export async function hojaDoctor(env: Record<string, string | undefined> = process.env, probe: Probe = fetch as any): Promise<string[]> {
 	const graphql = resolveHojaUrl(env);
 	const token = resolveHojaToken(env);
-	const tokenSource = ["HOJA_TOKEN", "LINEAR_TOKEN"].find(name => env[name]?.trim());
+	const tokenSource = env === process.env && credentials.source === "hoja-cli"
+		? `hoja auth login${credentials.workspace ? `, ${credentials.workspace}` : ""}`
+		: ["HOJA_TOKEN", "LINEAR_TOKEN"].find(name => env[name]?.trim());
 	const lines = [
-		`Token: ${token ? `set (from ${tokenSource}${env.HOJA_PLUGIN_TOKEN?.trim() ? ", plugin userConfig" : ""})` : MISSING_HOJA_TOKEN}`,
+		`Token: ${token ? `set (from ${tokenSource}${env.HOJA_PLUGIN_TOKEN?.trim() ? ", plugin userConfig" : ""})` : `${MISSING_HOJA_TOKEN}. ${SIGN_IN_HINT}`}`,
+		...(env === process.env ? credentials.problems.map(problem => `✗ ${problem}`) : []),
 		`GraphQL endpoint: ${graphql || HOJA_ENDPOINT_HINT}`,
 	];
 	if (graphql && token) {

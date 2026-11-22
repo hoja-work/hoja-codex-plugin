@@ -7,7 +7,7 @@
  */
 import { readFileSync } from "node:fs";
 import { createRuntime } from "./runtime.ts";
-import { applyUserConfig, dataDir } from "./env.ts";
+import { applyCredentials, dataDir } from "./env.ts";
 import { TASK_COMPLETION_CONTRACT } from "./generated/contract.ts";
 
 export async function sessionContext(input: { session_id?: string; transcript_path?: string; cwd?: string }, env: NodeJS.ProcessEnv = process.env): Promise<string> {
@@ -26,7 +26,7 @@ export async function sessionContext(input: { session_id?: string; transcript_pa
 }
 
 async function main() {
-	applyUserConfig();
+	applyCredentials();
 	let input: any = {};
 	try { input = JSON.parse(readFileSync(0, "utf8") || "{}"); } catch { /* no stdin: still emit the static context */ }
 	const additionalContext = await sessionContext(input);
