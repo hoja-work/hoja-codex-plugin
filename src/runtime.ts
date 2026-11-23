@@ -18,6 +18,10 @@ import { resolveMcpUrl, UpstreamMcp } from "./api-proxy.ts";
 import { authFetch, SIGN_IN_HINT } from "./credentials.ts";
 import { credentials } from "./env.ts";
 import { wrapHojaWriter } from "./hoja-writer.ts";
+import { TraceRecorder } from "./trace/recorder.ts";
+import { TraceService } from "./trace/service.ts";
+import type { FetchLike } from "./trace/upload.ts";
+import type { TraceDetail, TraceUpload } from "./env.ts";
 
 export const TASK_MANAGER_SYMBOL = Symbol.for("pi-swarm-task-manager");
 
@@ -35,16 +39,27 @@ export interface RuntimeOptions extends ShimOptions, BridgeOptions {
 	/** Injected in tests; production uses HojaClient resolved from HOJA_API_URL/HOJA_TOKEN (or LINEAR_*). */
 	hojaClient?: unknown;
 	hoja?: boolean;
+	/** Session tracing (src/trace/). Off only when the caller says so: the SessionStart hook builds a runtime too. */
+	trace?: { enabled?: boolean; upload?: TraceUpload; detail?: TraceDetail; fetchImpl?: FetchLike; env?: Record<string, string | undefined> };
 }
 
-export interface Runtime { shim: PiShim; manager: TaskManager; bridge: HookBridge }
+export interface Runtime { shim: PiShim; manager: TaskManager; bridge: HookBridge; traces: TraceService }
 
 export function createRuntime(options: RuntimeOptions): Runtime {
 	const shim = new PiShim(options);
 	const manager = registerTaskManage(shim.api as any, taskManageRenderers, { workspaceRoot: options.cwd, toolAliases });
 	// extensions/taskmanage/extension.ts: Swarm's builtin hooks read task state through this handle.
 	(globalThis as any)[TASK_MANAGER_SYMBOL] = manager;
-	const bridge = new HookBridge(shim, manager, options);
+	const tracing = options.trace?.enabled !== false;
+	const recorder = tracing ? new TraceRecorder({ dataDir: options.dataDir, detail: options.trace?.detail, log: options.log }) : undefined;
+	const bridge = new HookBridge(shim, manager, { ...options, recorder });
+	const traces = new TraceService({
+		dataDir: options.dataDir, upload: tracing ? options.trace?.upload ?? "completion" : "off", detail: options.trace?.detail ?? "full",
+		// Uploads go through the same credential as everything else: a CLI sign-in's token is refreshed before expiry
+		// and once after a 401 (src/credentials.ts).
+		env: options.trace?.env, fetchImpl: options.trace?.fetchImpl ?? (authFetch(credentials) as FetchLike), log: options.log,
+		session: () => ({ id: shim.sessionId, transcriptPath: shim.transcript.path, entries: shim.branch(), tasks: manager.snapshot().tasks }),
+	});
 	// extensions/taskmanage/extension.ts: the secondary coordinator is silent bookkeeping (task audit events) only.
 	registerTaskHooks(shim.api as any, manager, { enforcementMode: "off", silent: true });
 	// /tasks: Pi opens a read-only TUI browser; Claude Code shows the same widget as text.
@@ -55,6 +70,23 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 		const client = (options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials) as any })) as object;
 		registerHojaMode(shim.api, wrapHojaWriter(client, () => manager.snapshot().tasks, options.log) as any);
 	}
+	// Registered after hoja-mode, so its tool_result handler runs after publication linked the issue and closed it:
+	// a task that just completed gets this session's trace attached to its issue, and the model is told so.
+	shim.api.on("tool_result", async (event: any) => {
+		if (event?.toolName !== "TaskManage" || event.isError) return undefined;
+		const lines = await traces.afterTaskManage();
+		return lines.length ? { content: [...(event.content ?? []), { type: "text", text: lines.join("\n") }] } : undefined;
+	});
+	shim.api.registerCommand("trace", {
+		description: "Session trace: summary (default), upload [ISSUE], path",
+		handler: (args: string) => traces.run(args),
+	});
+	shim.api.registerTool({
+		name: "hoja_trace", label: "Hoja session trace",
+		description: "This session's trace (turns, model calls with token usage, every tool call with its duration and outcome, gate blocks, subagents). action \"summary\" (default, read-only) returns a readable summary and saves the hoja.trace/v1 JSON locally; \"path\" returns that file's path; \"upload\" attaches the trace to a Hoja issue (`issue`, e.g. HOJA-123, or every issue this session's tasks are linked to). Completed tasks linked to an issue get their trace attached automatically, so call upload only when asked or for an unlinked issue.",
+		parameters: { type: "object", properties: { action: { type: "string", enum: ["summary", "path", "upload"] }, issue: { type: "string", description: "Issue identifier for upload, e.g. HOJA-123" } }, additionalProperties: false },
+		execute: async (_id: string, params: any) => ({ content: [{ type: "text", text: await traces.run(`${params?.action ?? "summary"} ${params?.issue ?? ""}`) }], details: {} }),
+	});
 	// One report behind both entry points: the /setup command (answered by the hook, no model turn) and the
 	// `hoja_setup` tool, which is the fallback when that hook could not run.
 	const setupReport = async (ctx: any = shim.ctx()): Promise<string> => {
@@ -63,7 +95,9 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 		if (hoja) await hoja.handler("status", ctx);
 		const mode = shim.notifications.slice(before).map(n => n.message).join(" ");
 		shim.notifications.length = before;
-		return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...(await hojaDoctor()), mode && `Hoja mode: ${mode}`].filter(Boolean).join("\n");
+		const detail = (options.trace?.detail ?? "full") === "full" ? "full (whole prompts, tool inputs and outputs, secrets scrubbed; trace_detail: metadata to opt out)" : "metadata (timings, statuses, token counts)";
+		const trace = tracing ? `Session traces: upload ${options.trace?.upload ?? "completion"}, detail ${detail}${traces.uploadProblem() ? ` (uploads unavailable: ${traces.uploadProblem()})` : ""}` : "Session traces: off";
+		return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...(await hojaDoctor()), mode && `Hoja mode: ${mode}`, trace].filter(Boolean).join("\n");
 	};
 	// Claude-only: one place to see why Hoja is or isn't working (credential sources, both endpoints, mode, gate).
 	shim.api.registerCommand("setup", {
@@ -79,7 +113,7 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 		execute: async (_id: string, _params: unknown, _signal?: AbortSignal, _onUpdate?: unknown, ctx?: any) =>
 			({ content: [{ type: "text", text: await setupReport(ctx ?? shim.ctx()) }], details: {} }),
 	});
-	return { shim, manager, bridge };
+	return { shim, manager, bridge, traces };
 }
 
 type Probe = (url: string, init: any) => Promise<{ status: number; headers: { get(n: string): string | null }; text(): Promise<string> }>;

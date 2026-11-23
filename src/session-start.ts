@@ -7,7 +7,8 @@
  */
 import { readFileSync } from "node:fs";
 import { createRuntime } from "./runtime.ts";
-import { applyCredentials, dataDir } from "./env.ts";
+import { applyCredentials, dataDir, traceDetail } from "./env.ts";
+import { TraceRecorder } from "./trace/recorder.ts";
 import { TASK_COMPLETION_CONTRACT } from "./generated/contract.ts";
 
 export async function sessionContext(input: { session_id?: string; transcript_path?: string; cwd?: string }, env: NodeJS.ProcessEnv = process.env): Promise<string> {
@@ -29,6 +30,8 @@ async function main() {
 	applyCredentials();
 	let input: any = {};
 	try { input = JSON.parse(readFileSync(0, "utf8") || "{}"); } catch { /* no stdin: still emit the static context */ }
+	// SessionStart at launch reaches no MCP server (mcp_tool hooks are skipped then), so it is recorded here.
+	new TraceRecorder({ dataDir: dataDir(), detail: traceDetail() }).record(input.session_id, "SessionStart", input);
 	const additionalContext = await sessionContext(input);
 	process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext } }));
 }

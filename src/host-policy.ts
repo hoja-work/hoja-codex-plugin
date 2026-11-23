@@ -51,6 +51,8 @@ export const isAdapterReadOnlyTool = (toolName: string, params: unknown): boolea
 		const action = (params as any)?.action;
 		return action == null || action === "list";
 	}
+	// `hoja_trace` reads with `summary`/`path` (its default) and writes (an attachment on an issue) with `upload`.
+	if (name === "hojatrace") return (params as any)?.action !== "upload";
 	return READ_ONLY_HOST.has(name);
 };
 

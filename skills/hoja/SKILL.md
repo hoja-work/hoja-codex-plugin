@@ -1,6 +1,6 @@
 ---
 name: hoja
-description: Use the Hoja plugin's TaskManage workflow — plan work as tasks with acceptance questions, focus one before acting, and complete it only with real evidence. Also covers the hoja:tasks, hoja:hoja and hoja:setup prompt commands.
+description: Use the Hoja plugin's TaskManage workflow — plan work as tasks with acceptance questions, focus one before acting, and complete it only with real evidence. Also covers the hoja:tasks, hoja:hoja, hoja:trace and hoja:setup prompt commands.
 ---
 
 # Hoja task workflow
@@ -19,7 +19,9 @@ are blocked until a TaskManage task is focused. Read-only tools are always allow
    A rejected completion lists exactly what is missing — fix that input; never repeat it unchanged.
 
 With Hoja mode on, each top-level task is published as one Hoja issue, kept current on every update, and moved to
-Done with an evidence comment when it is completed.
+Done with an evidence comment when it is completed. That completion also attaches this session's trace (turns, model
+calls with tokens, every tool call and gate block) to the issue; the TaskManage result says so. The `hoja_trace`
+tool's `summary` only reads; `upload` is a write and needs a focused task.
 
 ## Prompt commands
 
@@ -30,6 +32,7 @@ Type these as the whole prompt. They are answered locally, with no model turn (t
 | --- | --- |
 | `hoja:tasks` | Show the read-only task board |
 | `hoja:hoja on` · `hoja:hoja off` · `hoja:hoja status` | Toggle or inspect Hoja mode for this chat |
+| `hoja:trace` · `hoja:trace upload HOJA-123` · `hoja:trace path` | This session's trace: summary, attach it to an issue now, or the JSON file's path |
 | `hoja:setup` | Check credentials, both Hoja endpoints, the project and the enforcement mode |
 
 If a prompt command comes back as instructions instead of an answer, the hook could not reach the plugin server. Then

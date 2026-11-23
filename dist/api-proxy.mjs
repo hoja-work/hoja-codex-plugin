@@ -145,7 +145,20 @@ function authFetch(credentials2, base = fetch) {
 var SIGN_IN_HINT = "Run `hoja auth login <your-workspace>` in a terminal (recommended), or set HOJA_TOKEN and HOJA_API_URL.";
 
 // src/env.ts
+var OPTION_ENV = [
+  ["HOJA_API_URL", "HOJA_PLUGIN_API_URL"],
+  ["HOJA_MCP_URL", "HOJA_PLUGIN_MCP_URL"],
+  ["HOJA_TOKEN", "HOJA_PLUGIN_TOKEN"],
+  ["HOJA_PROJECT", "HOJA_PLUGIN_PROJECT"],
+  ["TASK_ENFORCEMENT", "HOJA_PLUGIN_ENFORCEMENT"],
+  ["TRACE_UPLOAD", "HOJA_PLUGIN_TRACE_UPLOAD"],
+  ["TRACE_DETAIL", "HOJA_PLUGIN_TRACE_DETAIL"]
+];
 function applyUserConfig(env = process.env) {
+  for (const [option, name] of OPTION_ENV) {
+    const v = env[`CLAUDE_PLUGIN_OPTION_${option}`]?.trim();
+    if (v && !env[name]?.trim()) env[name] = v;
+  }
   const set = (from, to) => {
     const v = env[from]?.trim();
     if (v) env[to] = v;

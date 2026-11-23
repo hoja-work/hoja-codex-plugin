@@ -5,11 +5,11 @@
 # Hoja for Codex
 
 **Tasks that can't be marked done without proof.**
-Trebol's TaskManage, its task-enforcement gate and Hoja issue sync — as a Codex plugin.
+Trebol's TaskManage, its task-enforcement gate, Hoja issue sync and session traces — as a Codex plugin.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2F855A.svg)](LICENSE)
 [![Codex plugin](https://img.shields.io/badge/Codex-plugin-111111.svg)](https://developers.openai.com/codex/plugins)
-[![Tests](https://img.shields.io/badge/tests-355%20passing-2F855A.svg)](#verify-it-yourself)
+[![Tests](https://img.shields.io/badge/tests-387%20passing-2F855A.svg)](#verify-it-yourself)
 [![Claude Code version](https://img.shields.io/badge/also%20for-Claude%20Code-D97757.svg)](https://github.com/hoja-work/hoja-claude-plugin)
 
 </div>
@@ -73,7 +73,8 @@ Then work as usual, and type `hoja:setup` to check everything.
 | **Auto-continue** | When a gate block ends the turn, the `Stop` hook sends Codex back with exactly what to do, within the same bounded budget Trebol uses. |
 | **Hoja mode** | `hoja_list`, `hoja_get` and `hoja_project`, plus automatic publication: one Hoja issue per coarse task, acceptance questions in the description, an evidence comment and Done on completion. |
 | **Hosted Hoja API** | The workspace's full MCP API (70+ tools: issues, comments, decisions, projects, cycles) as a second server, `hoja_api`. Its **read** tools are exempt from the gate (see [Deviations from Trebol](#deviations-from-trebol)); its writes are gated and evidence-checked under the same names Trebol uses. |
-| **Prompt commands** | `hoja:tasks`, `hoja:hoja on\|off\|status` and `hoja:setup`, typed as the whole prompt. All are answered locally, with no model turn — and `hoja_setup`, the same read-only report as a tool, is the fallback when the prompt hook cannot run. Omit the slash: the Codex TUI rejects unknown `/` commands. |
+| **Session traces** | Every hook event is recorded; with the Codex rollout it becomes a `hoja.trace/v1` trace: turns, one model call per request with exact token usage, every tool call with its duration and outcome (non-zero exits, gate blocks, rejected TaskManage calls), subagents and task updates. Completing a task linked to an issue attaches the trace to that issue, and Hoja opens it in its trace viewer. See [Session traces](#session-traces). |
+| **Prompt commands** | `hoja:tasks`, `hoja:hoja on\|off\|status`, `hoja:trace [upload [ISSUE]\|path]` and `hoja:setup`, typed as the whole prompt. All are answered locally, with no model turn — and `hoja_setup`, the same read-only report as a tool, is the fallback when the prompt hook cannot run. Omit the slash: the Codex TUI rejects unknown `/` commands. |
 | **Skill** | `skills/hoja` teaches the create → focus → evidence workflow. |
 
 ## Configuration
@@ -88,12 +89,37 @@ variables (`env_vars` in [`.mcp.json`](.mcp.json)):
 | `HOJA_TOKEN` (deprecated alias: `LINEAR_TOKEN`) | Personal API token |
 | `HOJA_PROJECT` | Default project for publication. Also `.pi/config/hoja.json` in the repo |
 | `HOJA_TASK_ENFORCEMENT` | `block` (default) · `advise` · `off` |
+| `HOJA_TRACE_UPLOAD` | `completion` (default): attach the trace when a linked task completes · `session-end`: also attach the final trace to every linked issue at session end · `manual`: only `hoja:trace upload` · `off` |
+| `HOJA_TRACE_DETAIL` | `full` (default): whole prompts, tool inputs and outputs and model responses, secret-scrubbed · `metadata`: names, timings, statuses and token counts only |
 | `HOJA_PLUGIN_HEADLESS=1` | Use Trebol's headless (`swarm -p`) prompt semantics, e.g. for `codex exec` |
 | `HOJA_PLUGIN_DISABLE_HOJA=1` | Turn Hoja mode off entirely; TaskManage and the gate still run |
 | `HOJA_DEBUG_LOG=/path` | Append every hook and tool call the server receives |
 
 Like Trebol, there is **no default endpoint**: Hoja calls fail closed with a message naming the variable to set.
 Without credentials, TaskManage and the gate still work and publication is skipped.
+
+## Session traces
+
+The hook bridge appends every hook event to `$CODEX_HOME/plugins/data/hoja-hoja/traces/<session>.events.jsonl`. When a
+trace is needed it is built from those records plus the session's rollout:
+
+- `task_started` / `task_complete` mark each turn and its duration.
+- Each `token_usage_record` closes one model request, with its response id and exact usage. OpenAI counts cached
+  input inside `input_tokens`; the trace keeps `cache_read_tokens` separate, using Claude Code's OpenTelemetry names.
+- `function_call` / `function_call_output` pairs become tool spans. `exec_command` and `shell` show as `Bash`, with
+  the command as the label. A non-zero exit, a gate block or a rejected TaskManage call is marked as such.
+- `SubagentStart` / `SubagentStop`, `PreCompact` / `PostCompact` and `SessionEnd` come from hooks.
+
+The rollout format is internal to Codex, so it is read defensively. A session whose rollout cannot be read still gets
+a trace from hooks alone.
+
+Uploads use `POST /api/uploads` and `attachmentCreate`, named `codex-<session>-<time>.trace.json` with a
+"Codex trace · …" subtitle, which the Hoja web app opens in its trace viewer. Prompts and outputs are kept whole
+and scrubbed of credential shapes and secret-looking environment values. Trimming (head and tail kept) happens only
+when a trace would pass the 8 MB upload budget. `HOJA_TRACE_DETAIL=metadata` sends timings and counts only. Type
+`hoja:trace` for a summary, `hoja:trace upload HOJA-123` to attach it now, or `hoja:trace path` for the JSON file.
+The trace format and its privacy rules are described in full in the
+[Claude Code plugin's README](https://github.com/hoja-work/hoja-claude-plugin#session-traces).
 
 ## How it works
 
@@ -146,6 +172,7 @@ flowchart LR
 | `/tasks`, `/hoja` | `hoja:tasks`, `hoja:hoja`, matched in `UserPromptSubmit` and blocked locally (Codex has no `UserPromptExpansion`) |
 | Pi session messages | The Codex rollout. `exec_command` / `shell` count as `Bash`; MCP calls become `namespace__name` |
 | Session entries | `$CODEX_HOME/plugins/data/hoja-hoja/sessions/<id>.jsonl` |
+| — (tracing is plugin-only) | `SubagentStart`/`SubagentStop`, `PreCompact`/`PostCompact` → recorder; `SessionEnd` → `dist/trace-hook.mjs` (a command hook). Codex has no `PostToolUseFailure`: a failure is read from the `PostToolUse` result and the rollout |
 
 Codex gives hooks `PLUGIN_DATA` but not MCP servers, so the server derives the same directory from its install path.
 Both always agree.
@@ -164,7 +191,7 @@ Both always agree.
 git clone https://github.com/hoja-work/hoja-codex-plugin && cd hoja-codex-plugin
 npm ci
 npm run vendor:check   # 53 vendored files match vendor/MANIFEST.json (SHA-256)
-npm test               # Trebol's own 25 suites, unmodified, plus the adapter tests: 355 tests
+npm test               # Trebol's own 25 suites, unmodified, plus the adapter and trace tests: 387 tests
 npm run install:local  # codex plugin marketplace add . && codex plugin add hoja@hoja
 ```
 
@@ -185,6 +212,7 @@ You should see the block, a `TaskManage` create and focus, the retried command, 
 | `Unrecognized command '/hoja:setup'` | Type `hoja:setup` without the slash. |
 | `hoja_api` serves no tools | No endpoint or token reached the server. Export the variables before starting Codex. |
 | Tasks are not published | Run `hoja:hoja status` and `hoja:setup`. Publication needs a token and a resolvable project. |
+| No trace was attached | Only tasks linked to an issue get one, once per task. `hoja:trace` shows the upload status; `hoja:trace upload HOJA-123` attaches it by hand. |
 | A read-only tool was refused by the gate | Read tools of the hosted API and `hoja_project action:list` are exempt. A tool that is not on that list (or a shell command Trebol's allowlist does not know) is gated by design — set `HOJA_TASK_ENFORCEMENT=advise`, or use plain `ls`/`cat`/`grep`/`git log` forms. |
 
 ## Deviations from Trebol

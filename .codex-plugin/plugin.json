@@ -1,7 +1,7 @@
 {
   "name": "hoja",
-  "version": "0.3.1",
-  "description": "Trebol's TaskManage (acceptance questions + evidence-validated completion), its Swarm task-enforcement hooks and Hoja mode (automatic TaskManage → Hoja issue publication), plus the hosted Hoja API tools — ported 1:1 to Codex.",
+  "version": "0.4.1",
+  "description": "Trebol's TaskManage (acceptance questions + evidence-validated completion), its Swarm task-enforcement hooks, Hoja mode (automatic TaskManage → Hoja issue publication) and session traces attached to the issue the work belongs to, plus the hosted Hoja API tools — ported 1:1 to Codex.",
   "author": {
     "name": "Hoja",
     "url": "https://github.com/hoja-work"
@@ -10,20 +10,22 @@
   "repository": "https://github.com/hoja-work/hoja-codex-plugin",
   "license": "MIT",
   "keywords": [
+    "codex",
     "hoja",
-    "tasks",
-    "taskmanage",
     "hooks",
+    "observability",
     "project-management",
-    "codex"
+    "taskmanage",
+    "tasks",
+    "tracing"
   ],
   "mcpServers": "./.mcp.json",
   "hooks": "./hooks/hooks.json",
   "skills": "./skills/",
   "interface": {
     "displayName": "Hoja",
-    "shortDescription": "Evidence-checked tasks, a task gate and Hoja issue sync",
-    "longDescription": "Gives Codex Trebol's TaskManage: every task carries acceptance questions and can only be completed with evidence that resolves to a real file or a real tool result from this session. A task-enforcement gate blocks mutating tools until a task is focused, and Hoja mode publishes each coarse task as a Hoja issue and keeps it current.",
+    "shortDescription": "Evidence-checked tasks, a task gate, Hoja issue sync and session traces",
+    "longDescription": "Gives Codex Trebol's TaskManage: every task carries acceptance questions and can only be completed with evidence that resolves to a real file or a real tool result from this session. A task-enforcement gate blocks mutating tools until a task is focused, and Hoja mode publishes each coarse task as a Hoja issue and keeps it current. Every session is traced (turns, model calls with tokens, tool calls, gate blocks), and the trace is attached to the issue when its task completes.",
     "developerName": "Hoja",
     "category": "Productivity",
     "capabilities": [
@@ -33,6 +35,7 @@
     "websiteURL": "https://github.com/hoja-work/hoja-codex-plugin",
     "defaultPrompt": [
       "hoja:tasks",
+      "hoja:trace",
       "hoja:setup",
       "Plan this change as a TaskManage task with acceptance questions, then do it."
     ],

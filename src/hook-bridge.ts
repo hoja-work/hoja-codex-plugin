@@ -32,6 +32,7 @@ import { canonicalToolName, isOwnTool, type PiMessage } from "./transcript.ts";
 import { bashReadOnlyCommand, isAdapterReadOnlyTool, localCommandOf, normalizeCommandName } from "./host-policy.ts";
 import { hostOf, type Host } from "./host.ts";
 import type { PiShim } from "./pi-shim.ts";
+import type { TraceRecorder } from "./trace/recorder.ts";
 
 export interface BridgeOptions {
 	/** Trebol's taskmanage extension registers the pipeline in "block" mode; HOJA_TASK_ENFORCEMENT overrides. */
@@ -42,6 +43,8 @@ export interface BridgeOptions {
 	autogenSkills?: boolean;
 	/** Which host's hook wire shapes to speak; defaults to HOJA_PLUGIN_HOST. */
 	host?: Host;
+	/** Session tracing: every hook event, with the bridge's own answer, is handed to the recorder. */
+	recorder?: TraceRecorder;
 }
 
 export type HookPayload = Record<string, any>;
@@ -81,6 +84,7 @@ export class HookBridge {
 	private startedPostActingSession = "";
 	private readonly pendingToolCallIds = new Map<string, string[]>();
 	private readonly headless: boolean;
+	private readonly recorder?: TraceRecorder;
 	private readonly host: Host;
 	/** Codex: PreToolUse calls not yet settled by PostToolUse, so the turn flushes once per tool batch. */
 	private readonly inFlight = new Set<string>();
@@ -98,6 +102,7 @@ export class HookBridge {
 		});
 		const mode = options.enforcementMode ?? "block";
 		this.headless = options.headless ?? false;
+		this.recorder = options.recorder;
 		this.host = options.host ?? hostOf();
 		// Without the autogenskills extension Trebol never installs this source, and the vendored fallback counter
 		// ("only supports standalone pipeline tests") would block every 5th call until a Skill runs. A source that never
@@ -140,6 +145,15 @@ export class HookBridge {
 		// A host leaves a placeholder unexpanded (or null) when the event lacks that field; that means "absent".
 		const payload = Object.fromEntries(Object.entries(input).filter(([, v]) => v != null && !(typeof v === "string" && /^\$\{[\w.]+\}$/.test(v))));
 		await this.bind(payload);
+		const output = await this.dispatch(event, payload);
+		if (this.recorder) {
+			const text = event === "PostToolUse" ? responseText(payload.tool_response) : event === "PostToolUseFailure" ? responseText(payload.error ?? payload.tool_response) : undefined;
+			this.recorder.record(this.shim.sessionId, event, { ...payload, tool_input: parse(payload.tool_input) }, output, text);
+		}
+		return output;
+	}
+
+	private async dispatch(event: string, payload: HookPayload): Promise<HookOutput> {
 		switch (event) {
 			case "SessionStart": return {};
 			case "SessionEnd": await this.shim.emit("session_shutdown"); return {};
@@ -150,6 +164,8 @@ export class HookBridge {
 			case "PostToolUseFailure": return this.postTool(payload, true);
 			case "PostToolBatch": return this.turnEnd();
 			case "Stop": return this.stop(payload);
+			// Observed for tracing only: SubagentStart/Stop, PreCompact/PostCompact, Notification, StopFailure,
+			// PermissionDenied. None of them has a Trebol counterpart, so the answer is always "no change".
 			default: return {};
 		}
 	}

@@ -3,8 +3,19 @@ import { dirname, join, resolve } from "node:path";
 import { Credentials } from "./credentials.ts";
 import type { EnforcementMode } from "../vendor/trebol/.pi/lib/runtime/swarm-builtin-hooks.ts";
 
+const OPTION_ENV: [string, string][] = [
+	["HOJA_API_URL", "HOJA_PLUGIN_API_URL"], ["HOJA_MCP_URL", "HOJA_PLUGIN_MCP_URL"], ["HOJA_TOKEN", "HOJA_PLUGIN_TOKEN"],
+	["HOJA_PROJECT", "HOJA_PLUGIN_PROJECT"], ["TASK_ENFORCEMENT", "HOJA_PLUGIN_ENFORCEMENT"],
+	["TRACE_UPLOAD", "HOJA_PLUGIN_TRACE_UPLOAD"], ["TRACE_DETAIL", "HOJA_PLUGIN_TRACE_DETAIL"],
+];
 /** Plugin userConfig arrives as HOJA_PLUGIN_* (see .claude-plugin/plugin.json); empty means "not set". */
 export function applyUserConfig(env: NodeJS.ProcessEnv = process.env) {
+	// Hook command processes receive userConfig as CLAUDE_PLUGIN_OPTION_<KEY> (MCP servers get the HOJA_PLUGIN_* names
+	// from plugin.json), so both spellings land in the same place.
+	for (const [option, name] of OPTION_ENV) {
+		const v = env[`CLAUDE_PLUGIN_OPTION_${option}`]?.trim();
+		if (v && !env[name]?.trim()) env[name] = v;
+	}
 	const set = (from: string, to: string) => { const v = env[from]?.trim(); if (v) env[to] = v; };
 	set("HOJA_PLUGIN_API_URL", "HOJA_API_URL");
 	set("HOJA_PLUGIN_TOKEN", "HOJA_TOKEN");
@@ -39,3 +50,15 @@ export function enforcementMode(env: NodeJS.ProcessEnv = process.env): Enforceme
 export const headless = (env: NodeJS.ProcessEnv = process.env) =>
 	truthy(env.HOJA_PLUGIN_HEADLESS) || (!!env.CLAUDE_CODE_ENTRYPOINT && env.CLAUDE_CODE_ENTRYPOINT !== "cli");
 export const truthy = (v: string | undefined) => /^(1|true|yes|on)$/i.test(v?.trim() ?? "");
+
+/** When a finished trace goes to Hoja. `completion`: when a task linked to an issue completes (default). */
+export type TraceUpload = "completion" | "session-end" | "manual" | "off";
+export function traceUpload(env: NodeJS.ProcessEnv = process.env): TraceUpload {
+	const v = (env.HOJA_PLUGIN_TRACE_UPLOAD || env.HOJA_TRACE_UPLOAD || "completion").trim().toLowerCase();
+	return v === "session-end" || v === "manual" || v === "off" ? v : "completion";
+}
+/** How much content a trace keeps. `full`: whole prompts, tool inputs and outputs, secret-scrubbed. */
+export type TraceDetail = "full" | "metadata";
+export function traceDetail(env: NodeJS.ProcessEnv = process.env): TraceDetail {
+	return (env.HOJA_PLUGIN_TRACE_DETAIL || env.HOJA_TRACE_DETAIL || "full").trim().toLowerCase() === "metadata" ? "metadata" : "full";
+}
