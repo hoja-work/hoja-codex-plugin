@@ -9,7 +9,8 @@ import { appendFileSync } from "node:fs";
 import { hostOf } from "./host.ts";
 import { createInterface } from "node:readline";
 import { createRuntime } from "./runtime.ts";
-import { applyCredentials, dataDir, enforcementMode, headless, truthy } from "./env.ts";
+import { PLUGIN_VERSION } from "./trace/collect.ts";
+import { applyCredentials, dataDir, enforcementMode, headless, traceDetail, traceUpload, truthy } from "./env.ts";
 
 export const HOOK_TOOL = "__hoja_hook";
 
@@ -44,6 +45,7 @@ const runtime = createRuntime({
 	confirm: (title, message) => elicitation ? confirm(title, message) : Promise.resolve(false),
 	enforcementMode: enforcementMode(), headless: headless(), autogenSkills: truthy(process.env.HOJA_AUTOGEN_SKILLS),
 	hoja: !truthy(process.env.HOJA_PLUGIN_DISABLE_HOJA),
+	trace: { upload: traceUpload(), detail: traceDetail() },
 });
 if (debugLog) log(`start host=${hostOf()} dataDir=${dataDir()} enforcement=${enforcementMode()} headless=${headless()}`);
 const { shim, bridge } = runtime;
@@ -75,7 +77,7 @@ async function onMessage(message: Json) {
 	try {
 		if (method === "initialize") {
 			elicitation = !!params?.capabilities?.elicitation;
-			return send({ jsonrpc: "2.0", id, result: { protocolVersion: params?.protocolVersion ?? "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "hoja", version: "0.1.0" } } });
+			return send({ jsonrpc: "2.0", id, result: { protocolVersion: params?.protocolVersion ?? "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "hoja", version: PLUGIN_VERSION } } });
 		}
 		if (method === "tools/list") {
 			// Pi puts every registered tool in the prompt. Claude Code defers MCP tools behind ToolSearch unless asked not

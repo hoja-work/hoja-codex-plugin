@@ -1,5 +1,5 @@
 {
-  "description": "Trebol TaskManage + Swarm builtin hooks + Hoja mode. Every event is forwarded to the plugin's MCP server (one process per session), where the vendored Trebol code decides.",
+  "description": "Trebol TaskManage + Swarm builtin hooks + Hoja mode + session tracing. Every event is forwarded to the plugin's MCP server (one process per session), where the vendored Trebol code decides and the trace recorder writes one line per event. Only events Codex declares are registered; SessionStart and SessionEnd are command hooks.",
   "hooks": {
     "SessionStart": [
       {
@@ -44,7 +44,9 @@
               "transcript_path": "${transcript_path}",
               "cwd": "${cwd}",
               "prompt": "${prompt}",
-              "turn_id": "${turn_id}"
+              "turn_id": "${turn_id}",
+              "model": "${model}",
+              "permission_mode": "${permission_mode}"
             },
             "timeout": 45
           }
@@ -65,7 +67,9 @@
               "cwd": "${cwd}",
               "tool_name": "${tool_name}",
               "tool_input": "${tool_input}",
-              "tool_use_id": "${tool_use_id}"
+              "tool_use_id": "${tool_use_id}",
+              "model": "${model}",
+              "permission_mode": "${permission_mode}"
             },
             "timeout": 20
           }
@@ -87,7 +91,9 @@
               "tool_name": "${tool_name}",
               "tool_input": "${tool_input}",
               "tool_use_id": "${tool_use_id}",
-              "tool_response": "${tool_response}"
+              "tool_response": "${tool_response}",
+              "model": "${model}",
+              "permission_mode": "${permission_mode}"
             },
             "timeout": 20
           }
@@ -110,6 +116,96 @@
               "last_assistant_message": "${last_assistant_message}"
             },
             "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "SubagentStart",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "agent_id": "${agent_id}",
+              "agent_type": "${agent_type}"
+            },
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "SubagentStop",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "agent_id": "${agent_id}",
+              "agent_type": "${agent_type}",
+              "agent_transcript_path": "${agent_transcript_path}"
+            },
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "PreCompact",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "trigger": "${trigger}"
+            },
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "hoja",
+            "tool": "__hoja_hook",
+            "input": {
+              "event": "PostCompact",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "cwd": "${cwd}",
+              "trigger": "${trigger}"
+            },
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOJA_PLUGIN_HOST=codex node \"$PLUGIN_ROOT/dist/trace-hook.mjs\"",
+            "timeout": 3
           }
         ]
       }

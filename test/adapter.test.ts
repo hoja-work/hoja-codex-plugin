@@ -133,15 +133,21 @@ describe("prompt and packaging parity", () => {
 		const hooks = JSON.parse(readFileSync(join(root, "hooks/hooks.json"), "utf8")).hooks;
 		for (const [event, groups] of Object.entries<any[]>(hooks)) for (const g of groups) for (const h of g.hooks) {
 			if (h.type === "mcp_tool") { expect(h.server).toBe(codex ? "hoja" : "plugin:hoja:hoja"); expect(h.tool).toBe("__hoja_hook"); expect(h.input.event).toBe(event); }
-			else if (codex) expect(h.command).toBe('HOJA_PLUGIN_HOST=codex node "$PLUGIN_ROOT/dist/session-start.mjs"');
-			else expect(h.args[0]).toBe("${CLAUDE_PLUGIN_ROOT}/dist/session-start.mjs");
+			else if (codex) expect(h.command).toBe(`HOJA_PLUGIN_HOST=codex node "$PLUGIN_ROOT/dist/${event === "SessionEnd" ? "trace-hook" : "session-start"}.mjs"`);
+			// Command hooks: SessionStart (no MCP client exists at launch) and SessionEnd (the server may be gone).
+			else expect(h.args[0]).toBe(event === "SessionEnd" ? "${CLAUDE_PLUGIN_ROOT}/dist/trace-hook.mjs" : "${CLAUDE_PLUGIN_ROOT}/dist/session-start.mjs");
 		}
 		if (codex) {
 			const servers = JSON.parse(readFileSync(join(root, ".mcp.json"), "utf8")).mcpServers;
 			expect(Object.keys(servers).sort()).toEqual(["hoja", "hoja_api"]);
 			for (const server of Object.values<any>(servers)) expect(server.env.HOJA_PLUGIN_HOST).toBe("codex");
-			// Codex never passes hook placeholders it lacks; agent_id is not a Codex tool/prompt field.
-			expect(JSON.stringify(hooks)).not.toContain("${agent_id}");
+			// Codex never passes hook placeholders it lacks. agent_id is sent only where it names the subagent itself
+			// (SubagentStart/Stop): on tool and prompt events it would mark the main session as a subagent.
+			for (const [event, groups] of Object.entries<any[]>(hooks))
+				if (!event.startsWith("Subagent")) expect(JSON.stringify(groups), event).not.toContain("${agent_id}");
+			// Only events Codex 0.169 declares (its embedded hook schemas); Claude-only events would never fire.
+			const declared = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact"];
+			for (const event of Object.keys(hooks)) expect(declared, event).toContain(event);
 		}
 	});
 	it("bundled MCP server speaks JSON-RPC and loads its tools upfront", async () => {

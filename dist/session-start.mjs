@@ -1,7 +1,7 @@
 // Built by scripts/build.mjs from src/ and vendor/trebol/ (see vendor/MANIFEST.json). Do not edit.
 
 // src/session-start.ts
-import { readFileSync as readFileSync5 } from "node:fs";
+import { readFileSync as readFileSync8 } from "node:fs";
 
 // vendor/trebol/packages/tools/taskmanage/src/persistence.ts
 var CURRENT_SCHEMA_VERSION = 2;
@@ -256,8 +256,8 @@ function swarmValidateTaskManageParams(params) {
   }
 }
 function goNow() {
-  const ms = Date.now();
-  const iso = new Date(ms).toISOString();
+  const ms2 = Date.now();
+  const iso = new Date(ms2).toISOString();
   const sub = String(Number(process.hrtime.bigint() % 1000000n)).padStart(6, "0");
   const frac = (iso.slice(20, 23) + sub).replace(/0+$/, "");
   return `${iso.slice(0, 19)}${frac ? `.${frac}` : ""}Z`;
@@ -430,12 +430,12 @@ function renderTaskResult(task, first, width, theme) {
   const prefix = first ? "    \u23BF " : "      ";
   const rawIcon = task.status === "completed" ? "\u2713" : task.status === "in_progress" ? "\u25C9" : task.status === "pending" ? "\u25CB" : "?";
   if (width <= taskDisplayWidth(prefix) + 2) return truncate(`${prefix}${rawIcon}`, width);
-  const icon = task.status === "completed" ? style(theme, "success", rawIcon) : task.status === "in_progress" ? style(theme, "warning", rawIcon) : dim(theme, rawIcon);
+  const icon2 = task.status === "completed" ? style(theme, "success", rawIcon) : task.status === "in_progress" ? style(theme, "warning", rawIcon) : dim(theme, rawIcon);
   const label = `${task.id ? `#${task.id} ` : ""}${task.content || task.subject || "Untitled task"}`;
   const available = Math.max(0, width - taskDisplayWidth(prefix) - 2);
   const text3 = truncate(label, available);
   const rendered = task.status === "in_progress" ? bold(theme, text3) : task.status === "completed" ? dim(theme, text3) : text3;
-  return `${prefix}${icon} ${rendered}`;
+  return `${prefix}${icon2} ${rendered}`;
 }
 var taskManageRenderers = {
   renderCall(_args, theme) {
@@ -2940,9 +2940,9 @@ var COMMENT_BODY_LIMIT = 1200;
 var text2 = (value, isError = false) => ({ content: [{ type: "text", text: JSON.stringify(value) }], details: {}, ...isError ? { isError: true } : {} });
 function instant(value, field) {
   const raw = value.trim();
-  const ms = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T00:00:00.000Z` : raw);
-  if (!Number.isFinite(ms)) throw new Error(`${field} must be an ISO date (YYYY-MM-DD) or an ISO timestamp`);
-  return new Date(ms).toISOString();
+  const ms2 = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T00:00:00.000Z` : raw);
+  if (!Number.isFinite(ms2)) throw new Error(`${field} must be an ISO date (YYYY-MM-DD) or an ISO timestamp`);
+  return new Date(ms2).toISOString();
 }
 function integer2(raw, name, fallback, min, max) {
   if (raw === void 0 || raw === null || raw === "") return fallback;
@@ -5209,6 +5209,7 @@ var isAdapterReadOnlyTool = (toolName2, params) => {
     const action = params?.action;
     return action == null || action === "list";
   }
+  if (name === "hojatrace") return params?.action !== "upload";
   return READ_ONLY_HOST.has(name);
 };
 var stripFdRedirections = (command) => command.replace(/(?:^|(?<=[\s;|&]))(\d*|&)>>?\s*&(?:(\d+)|-)/g, " ").replace(/(?:^|(?<=[\s;|&]))(\d*|&)>>?\s*\/dev\/null/g, " ").replace(/[ \t]{2,}/g, " ").trim();
@@ -5261,6 +5262,7 @@ var HookBridge = class {
     });
     const mode = options.enforcementMode ?? "block";
     this.headless = options.headless ?? false;
+    this.recorder = options.recorder;
     this.host = options.host ?? hostOf();
     if (!options.autogenSkills && !globalThis[AUTOGEN_BUDGET_SOURCE])
       globalThis[AUTOGEN_BUDGET_SOURCE] = { gateTool: () => void 0, budgetStatus: () => ({ used: 0, budget: Infinity }) };
@@ -5293,6 +5295,7 @@ var HookBridge = class {
   startedPostActingSession = "";
   pendingToolCallIds = /* @__PURE__ */ new Map();
   headless;
+  recorder;
   host;
   /** Codex: PreToolUse calls not yet settled by PostToolUse, so the turn flushes once per tool batch. */
   inFlight = /* @__PURE__ */ new Set();
@@ -5320,6 +5323,14 @@ var HookBridge = class {
   async handle(event, input2) {
     const payload = Object.fromEntries(Object.entries(input2).filter(([, v]) => v != null && !(typeof v === "string" && /^\$\{[\w.]+\}$/.test(v))));
     await this.bind(payload);
+    const output = await this.dispatch(event, payload);
+    if (this.recorder) {
+      const text3 = event === "PostToolUse" ? responseText(payload.tool_response) : event === "PostToolUseFailure" ? responseText(payload.error ?? payload.tool_response) : void 0;
+      this.recorder.record(this.shim.sessionId, event, { ...payload, tool_input: parse(payload.tool_input) }, output, text3);
+    }
+    return output;
+  }
+  async dispatch(event, payload) {
     switch (event) {
       case "SessionStart":
         return {};
@@ -5340,6 +5351,8 @@ var HookBridge = class {
         return this.turnEnd();
       case "Stop":
         return this.stop(payload);
+      // Observed for tracing only: SubagentStart/Stop, PreCompact/PostCompact, Notification, StopFailure,
+      // PermissionDenied. None of them has a Trebol counterpart, so the answer is always "no change".
       default:
         return {};
     }
@@ -5555,7 +5568,20 @@ function authFetch(credentials2, base = fetch) {
 var SIGN_IN_HINT = "Run `hoja auth login <your-workspace>` in a terminal (recommended), or set HOJA_TOKEN and HOJA_API_URL.";
 
 // src/env.ts
+var OPTION_ENV = [
+  ["HOJA_API_URL", "HOJA_PLUGIN_API_URL"],
+  ["HOJA_MCP_URL", "HOJA_PLUGIN_MCP_URL"],
+  ["HOJA_TOKEN", "HOJA_PLUGIN_TOKEN"],
+  ["HOJA_PROJECT", "HOJA_PLUGIN_PROJECT"],
+  ["TASK_ENFORCEMENT", "HOJA_PLUGIN_ENFORCEMENT"],
+  ["TRACE_UPLOAD", "HOJA_PLUGIN_TRACE_UPLOAD"],
+  ["TRACE_DETAIL", "HOJA_PLUGIN_TRACE_DETAIL"]
+];
 function applyUserConfig(env = process.env) {
+  for (const [option, name] of OPTION_ENV) {
+    const v = env[`CLAUDE_PLUGIN_OPTION_${option}`]?.trim();
+    if (v && !env[name]?.trim()) env[name] = v;
+  }
   const set = (from, to) => {
     const v = env[from]?.trim();
     if (v) env[to] = v;
@@ -5577,6 +5603,9 @@ function dataDir(env = process.env, script = process.argv[1]) {
   const installed = script ? /^(.*)[\\/]plugins[\\/]cache[\\/]([^\\/]+)[\\/]([^\\/]+)[\\/][^\\/]+$/.exec(resolve2(dirname2(resolve2(script)), "..")) : null;
   if (installed) return join3(installed[1], "plugins", "data", `${installed[3]}-${installed[2]}`);
   return join3(env.CODEX_HOME?.trim() || join3(homedir(), ".codex"), "plugins", "data", "hoja-standalone");
+}
+function traceDetail(env = process.env) {
+  return (env.HOJA_PLUGIN_TRACE_DETAIL || env.HOJA_TRACE_DETAIL || "full").trim().toLowerCase() === "metadata" ? "metadata" : "full";
 }
 
 // src/api-proxy.ts
@@ -5798,6 +5827,1121 @@ function wrapHojaWriter(client, tasks, log) {
   });
 }
 
+// src/trace/recorder.ts
+import { appendFileSync as appendFileSync2, existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync5 } from "node:fs";
+import { join as join4 } from "node:path";
+
+// src/trace/redact.ts
+var PATTERNS = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  /\bsk-ant-[A-Za-z0-9_-]{16,}/g,
+  /\bsk-[A-Za-z0-9_-]{20,}/g,
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+  /\b(?:hoja|lin)_(?:api|oauth)_[A-Za-z0-9]{16,}/g
+];
+var ASSIGNMENTS = /((?:authorization|bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|client[_-]?secret)["']?\s*[:=]\s*["']?(?:bearer\s+)?)([^\s"',;&]{8,})/gi;
+var SECRET_ENV = /(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL)/i;
+var Redactor = class {
+  literals;
+  constructor(env = process.env) {
+    this.literals = Object.entries(env).filter(([name, value]) => SECRET_ENV.test(name) && typeof value === "string" && value.trim().length >= 8).map(([, value]) => value.trim()).sort((a, b) => b.length - a.length);
+  }
+  scrub(text3) {
+    let out = text3;
+    for (const literal of this.literals) if (out.includes(literal)) out = out.split(literal).join("[redacted]");
+    for (const pattern of PATTERNS) out = out.replace(pattern, "[redacted]");
+    return out.replace(ASSIGNMENTS, "$1[redacted]");
+  }
+};
+var FIELD_CAP = 256e3;
+function clipMiddle(text3, max) {
+  if (text3.length <= max) return text3;
+  const head = Math.ceil(max * 0.6), tail = max - head;
+  const omitted = text3.length - head - tail;
+  return `${text3.slice(0, head).replace(/[\uD800-\uDBFF]$/, "")}
+\u2026 [${omitted} chars omitted] \u2026
+${text3.slice(text3.length - tail).replace(/^[\uDC00-\uDFFF]/, "")}`;
+}
+function clip2(text3, max, counted = true) {
+  if (text3.length <= max) return text3;
+  const head = text3.slice(0, max).replace(/[\uD800-\uDBFF]$/, "");
+  return counted ? `${head}\u2026 [+${text3.length - head.length} chars]` : `${head.trimEnd()}\u2026`;
+}
+function taskOps(ops) {
+  return ops.map((op) => op?.op === "create" ? `create ${op.subject ?? ""}`.trim() : op?.op === "update" ? `#${op.taskId ?? "?"}${op.status ? ` \u2192 ${op.status}` : op.active ? " focus" : " update"}` : String(op?.op ?? "")).filter(Boolean).join(", ");
+}
+function inputPreview(tool, input2) {
+  if (input2 == null) return "";
+  if (typeof input2 === "string") return input2;
+  const i = input2;
+  const pick = (...keys) => keys.map((k) => i[k]).find((v) => typeof v === "string" && v);
+  const lead = tool === "Bash" ? pick("command") : /^(Read|Write|Edit|MultiEdit|NotebookEdit)$/.test(tool) ? pick("file_path", "notebook_path") : /^(Grep|Glob)$/.test(tool) ? [pick("pattern"), pick("path")].filter(Boolean).join("  in ") : /^(WebFetch|WebSearch)$/.test(tool) ? pick("url", "query") : tool === "Agent" || tool === "Task" ? pick("description", "prompt") : tool === "TaskManage" && Array.isArray(i.operations) ? taskOps(i.operations) : pick("action", "query", "identifier", "issue", "subject", "description", "url", "name", "command", "path");
+  if (lead) return lead;
+  const pairs = Object.entries(i).filter(([, v]) => v !== null && ["string", "number", "boolean"].includes(typeof v)).map(([k, v]) => `${k}=${typeof v === "string" ? JSON.stringify(v) : v}`);
+  if (pairs.length) return pairs.join(" ");
+  try {
+    return JSON.stringify(input2);
+  } catch {
+    return String(input2);
+  }
+}
+function toolLabel(tool, input2) {
+  const preview = inputPreview(tool, input2).split("\n")[0];
+  return preview && preview !== "{}" ? `${tool} \xB7 ${clip2(preview, 100, false)}` : tool;
+}
+
+// src/trace/recorder.ts
+var SAFE_ID2 = /^[A-Za-z0-9._-]{1,128}$/;
+var tracesDir = (dataDir2) => join4(dataDir2, "traces");
+var eventsPath = (dataDir2, sessionId) => join4(tracesDir(dataDir2), `${SAFE_ID2.test(sessionId) ? sessionId : "invalid-session"}.events.jsonl`);
+var tracePath = (dataDir2, sessionId) => join4(tracesDir(dataDir2), `${SAFE_ID2.test(sessionId) ? sessionId : "invalid-session"}.trace.json`);
+var num = (v) => {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : void 0;
+};
+var str = (v) => typeof v === "string" && v ? v : void 0;
+var TraceRecorder = class {
+  constructor(options) {
+    this.options = options;
+    this.redactor = options.redactor ?? new Redactor();
+    this.full = (options.detail ?? "full") === "full";
+  }
+  options;
+  redactor;
+  full;
+  lastTranscript;
+  text(value, max) {
+    if (!this.full) return void 0;
+    const s = typeof value === "string" ? value : value == null ? "" : (() => {
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    })();
+    return s ? clip2(this.redactor.scrub(s), max) : void 0;
+  }
+  /** Whole content (scrubbed), for hooks-only traces: prompts, tool inputs, outputs and errors. */
+  content(value) {
+    if (!this.full) return void 0;
+    const s = typeof value === "string" ? value : value == null ? "" : (() => {
+      try {
+        return JSON.stringify(value, null, 1);
+      } catch {
+        return String(value);
+      }
+    })();
+    return s ? clipMiddle(this.redactor.scrub(s), FIELD_CAP) : void 0;
+  }
+  /** Shape one hook payload (already placeholder-filtered by the bridge) plus the bridge's own decision. */
+  shape(event, payload, output = {}, outputText) {
+    const at = (this.options.now?.() ?? /* @__PURE__ */ new Date()).toISOString();
+    const tool = str(payload.tool_name);
+    const hso = output?.hookSpecificOutput ?? {};
+    const record2 = {
+      at,
+      event,
+      agentId: str(payload.agent_id),
+      agentType: str(payload.agent_type),
+      tool,
+      toolUseId: str(payload.tool_use_id),
+      durationMs: num(payload.duration_ms),
+      permissionMode: str(payload.permission_mode),
+      model: typeof payload.model === "string" ? payload.model : str(payload.model?.id)
+    };
+    if (event === "PreToolUse") {
+      if (hso.permissionDecision === "deny") {
+        record2.decision = "deny";
+        record2.reason = this.content(hso.permissionDecisionReason) ?? "blocked";
+      } else if (hso.additionalContext) record2.context = this.content(hso.additionalContext);
+      record2.label = this.text(inputPreview(tool ?? "", payload.tool_input).split("\n")[0], 200);
+      record2.input = this.content(payload.tool_input && typeof payload.tool_input === "object" && !Object.keys(payload.tool_input).length ? "" : tool === "Bash" ? inputPreview(tool, payload.tool_input) : payload.tool_input);
+    }
+    if (event === "PostToolUse") record2.output = this.content(outputText);
+    if (event === "PostToolUseFailure") {
+      record2.error = this.content(outputText ?? payload.error) ?? "failed";
+      if (payload.is_interrupt === true || payload.is_interrupt === "true") record2.interrupted = true;
+    }
+    if (event === "UserPromptSubmit") record2.prompt = this.content(payload.prompt);
+    if (event === "SessionStart") record2.source = str(payload.source);
+    const transcript = str(payload.transcript_path);
+    if (transcript && !payload.agent_id && this.lastTranscript !== transcript) {
+      record2.transcriptPath = transcript;
+      this.lastTranscript = transcript;
+    }
+    if (event === "SessionEnd") record2.reason = str(payload.reason);
+    if (event === "PreCompact" || event === "PostCompact") record2.trigger = str(payload.trigger);
+    if (event === "Notification") {
+      record2.message = this.text(payload.message, 300);
+      record2.notificationType = str(payload.notification_type);
+    }
+    if (event === "StopFailure") record2.error = this.content(payload.error) ?? "turn failed";
+    if (event === "PermissionDenied") record2.reason = this.text(payload.reason, 300);
+    if (event === "SubagentStop") record2.agentTranscriptPath = str(payload.agent_transcript_path);
+    return Object.fromEntries(Object.entries(record2).filter(([, v]) => v !== void 0));
+  }
+  record(sessionId, event, payload, output, outputText) {
+    if (!sessionId) return;
+    try {
+      const line = JSON.stringify(this.shape(event, payload, output, outputText));
+      mkdirSync3(tracesDir(this.options.dataDir), { recursive: true, mode: 448 });
+      appendFileSync2(eventsPath(this.options.dataDir, sessionId), line + "\n", { mode: 384 });
+    } catch (error) {
+      this.options.log?.(`trace record failed: ${error.message}`);
+    }
+  }
+};
+function readHookRecords(dataDir2, sessionId) {
+  const path = eventsPath(dataDir2, sessionId);
+  if (!existsSync3(path)) return [];
+  return readFileSync5(path, "utf8").split("\n").flatMap((line) => {
+    try {
+      return line.trim() ? [JSON.parse(line)] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// src/trace/collect.ts
+import { existsSync as existsSync4, readdirSync, readFileSync as readFileSync6, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, renameSync } from "node:fs";
+import { basename, dirname as dirname3, join as join5, resolve as resolve3, sep as sep2 } from "node:path";
+import { statSync as statSync4 } from "node:fs";
+
+// src/trace/schema.ts
+var TRACE_SCHEMA = "hoja.trace/v1";
+var emptyUsage = () => ({ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 });
+var addUsage = (a, b) => {
+  a.input_tokens += b.input_tokens;
+  a.output_tokens += b.output_tokens;
+  a.cache_read_tokens += b.cache_read_tokens;
+  a.cache_creation_tokens += b.cache_creation_tokens;
+};
+var totalTokens = (u) => u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_creation_tokens;
+
+// src/trace/build.ts
+var PERSISTED = /<persisted-output>[\s\S]*?Full output saved to: (\S+)/;
+var ms = (iso) => {
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isFinite(t) ? t : void 0;
+};
+var between = (a, b) => {
+  const x = ms(a), y = ms(b);
+  return x !== void 0 && y !== void 0 && y >= x ? y - x : void 0;
+};
+var parseLines = (text3) => text3.split("\n").flatMap((line) => {
+  if (!line.trim()) return [];
+  try {
+    const v = JSON.parse(line);
+    return v && typeof v === "object" ? [v] : [];
+  } catch {
+    return [];
+  }
+});
+var firstLine = (s) => s.split("\n").find((l) => l.trim())?.trim() ?? "";
+var INJECTED_PROMPT = /^\s*<(command-name|command-message|command-args|local-command-stdout|local-command-caveat|system-reminder|task-notification|user-prompt-submit-hook)\b/;
+function usageOf(u) {
+  if (!u || typeof u !== "object") return void 0;
+  const n = (v) => typeof v === "number" && Number.isFinite(v) ? v : 0;
+  return { input_tokens: n(u.input_tokens), output_tokens: n(u.output_tokens), cache_read_tokens: n(u.cache_read_input_tokens), cache_creation_tokens: n(u.cache_creation_input_tokens) };
+}
+function resultText(content, toolUseResult) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const text3 = content.map((c) => typeof c === "string" ? c : c?.type === "text" ? String(c.text ?? "") : c?.type === "image" ? "[image]" : "").filter(Boolean).join("\n");
+    if (text3) return text3;
+  }
+  const r = toolUseResult;
+  if (typeof r === "string") return r;
+  if (r && typeof r === "object") return [r.stdout, r.stderr].filter((s) => typeof s === "string" && s).join("\n");
+  return "";
+}
+function codexToolName(item) {
+  if (item.type === "local_shell_call") return "Bash";
+  const name = String(item.name ?? "tool");
+  const ns = typeof item.namespace === "string" ? item.namespace : "";
+  if (!ns) return /^(exec_command|shell|container\.exec)$/.test(name) ? "Bash" : name === "apply_patch" ? "Edit" : name;
+  if (ns === "mcp__hoja") return name;
+  if (ns === "mcp__hoja_api" || ns === "mcp__hoja-api") return `hoja/${name}`;
+  return `${ns.replace(/^mcp__/, "")}/${name}`;
+}
+function displayToolName(raw) {
+  const canonical = canonicalToolName(raw);
+  const mcp = /^mcp__(?:plugin_([^_]+(?:_[^_]+)*?)_)?([^_].*?)__(.+)$/.exec(canonical);
+  if (!mcp) return canonical;
+  return canonical.startsWith("mcp__hoja__") ? `hoja/${mcp[3]}` : `${mcp[2]}/${mcp[3]}`;
+}
+var Builder = class {
+  constructor(input2) {
+    this.input = input2;
+    this.full = (input2.detail ?? "full") === "full";
+    this.redactor = input2.redactor ?? new Redactor();
+  }
+  input;
+  spans = [];
+  events = [];
+  toolSpans = /* @__PURE__ */ new Map();
+  llmSpans = /* @__PURE__ */ new Map();
+  models = /* @__PURE__ */ new Set();
+  truncated = [];
+  title;
+  firstPrompt;
+  cwd;
+  gitBranch;
+  permissionMode;
+  hostVersion;
+  turnCount = 0;
+  full;
+  redactor;
+  /** Whole content, scrubbed; capped only at FIELD_CAP (head and tail kept). */
+  content(value) {
+    if (!this.full || !value) return void 0;
+    return clipMiddle(this.redactor.scrub(value), FIELD_CAP);
+  }
+  preview(value, max) {
+    if (!this.full || !value) return void 0;
+    return clip2(this.redactor.scrub(value), max);
+  }
+  add(span) {
+    this.spans.push(span);
+    return span;
+  }
+  label(tool, input2) {
+    const name = displayToolName(tool);
+    if (!this.full) return name;
+    const label = this.redactor.scrub(toolLabel(name, input2));
+    return this.cwd ? label.split(`${this.cwd}/`).join("") : label;
+  }
+  /** One transcript (the main session or one subagent) into spans under `rootId`. */
+  walk(entries, rootId, agentId) {
+    const main3 = agentId === void 0;
+    let turn;
+    let lastTs;
+    let lastSeen;
+    const parent = () => turn?.id ?? rootId;
+    const closeTurn = (end) => {
+      if (!turn) return;
+      turn.end ??= end ?? lastSeen;
+      turn.durationMs ??= between(turn.start, turn.end);
+      if (turn.status === "running") turn.status = "ok";
+    };
+    for (const entry of entries) {
+      const ts = typeof entry.timestamp === "string" ? entry.timestamp : void 0;
+      if (main3) {
+        if (entry.type === "ai-title" && typeof entry.aiTitle === "string") this.title = entry.aiTitle;
+        if (entry.type === "summary" && typeof entry.summary === "string") this.title ??= entry.summary;
+        if (typeof entry.cwd === "string") this.cwd ??= entry.cwd;
+        if (typeof entry.gitBranch === "string" && entry.gitBranch) this.gitBranch = entry.gitBranch;
+        if (typeof entry.permissionMode === "string") this.permissionMode = entry.permissionMode;
+        if (typeof entry.version === "string") this.hostVersion ??= entry.version;
+      }
+      if (entry.type === "system" && main3) {
+        if (entry.subtype === "turn_duration" && turn) {
+          turn.end = ts ?? lastSeen;
+          if (typeof entry.durationMs === "number") turn.durationMs = entry.durationMs;
+        }
+        if (entry.subtype === "compact_boundary" && ts) this.events.push({ at: ts, kind: "compaction", message: `Context compacted${entry.compactMetadata?.trigger ? ` (${entry.compactMetadata.trigger})` : ""}`, spanId: turn?.id });
+        if (ts) lastSeen = ts;
+        continue;
+      }
+      const message = entry.message;
+      if (!message || typeof message !== "object") continue;
+      if (entry.type === "user" && message.role === "user") {
+        const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] : Array.isArray(message.content) ? message.content : [];
+        const prompt = blocks.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n");
+        for (const block of blocks) {
+          if (block?.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
+          const span = this.toolSpans.get(block.tool_use_id);
+          if (!span) continue;
+          span.end = ts ?? span.end;
+          span.durationMs = between(span.start, span.end);
+          let text3 = resultText(block.content, entry.toolUseResult);
+          const saved = PERSISTED.exec(text3)?.[1];
+          if (saved && this.full) {
+            const whole = this.input.readPersisted?.(saved);
+            if (whole) {
+              text3 = whole;
+              span.attrs = { ...span.attrs, persisted: true };
+            }
+          }
+          span.status = block.is_error === true ? /^\s*\[TASK ENFORCEMENT|hook (?:error|blocked)|blocked by (?:a )?(?:PreToolUse )?hook/i.test(text3) ? "blocked" : /interrupted by user/i.test(text3) ? "interrupted" : "error" : "ok";
+          const out = this.content(text3);
+          if (out) span.attrs = { ...span.attrs, [span.status === "ok" ? "output" : "error"]: out };
+        }
+        const genuine = prompt && !blocks.some((b) => b?.type === "tool_result") && entry.isMeta !== true && entry.isCompactSummary !== true && !INJECTED_PROMPT.test(prompt);
+        if (genuine && main3) {
+          closeTurn(lastSeen);
+          this.turnCount++;
+          this.firstPrompt ??= prompt;
+          turn = this.add({
+            id: `turn:${this.turnCount}`,
+            parentId: rootId,
+            kind: "turn",
+            status: "running",
+            name: this.full ? clip2(firstLine(this.redactor.scrub(prompt)), 90, false) : `Turn ${this.turnCount}`,
+            start: ts ?? lastSeen ?? (/* @__PURE__ */ new Date(0)).toISOString(),
+            attrs: { index: this.turnCount, ...this.full ? { prompt: this.content(prompt) } : {} }
+          });
+        } else if (genuine && !main3) {
+          const root = this.spans.find((s) => s.id === rootId);
+          if (root && this.full && !root.attrs?.prompt) root.attrs = { ...root.attrs, prompt: this.content(prompt) };
+        }
+        if (ts) {
+          lastTs = ts;
+          lastSeen = ts;
+        }
+        continue;
+      }
+      if (entry.type === "assistant" && message.role === "assistant") {
+        const id = typeof message.id === "string" ? message.id : String(entry.uuid ?? `${this.spans.length}`);
+        let span = this.llmSpans.get(id);
+        const model = typeof message.model === "string" && message.model !== "<synthetic>" ? message.model : void 0;
+        if (model) this.models.add(model);
+        if (!span) {
+          span = this.add({ id: `llm:${id}`, parentId: parent(), kind: "llm", name: model ?? "model", start: lastTs ?? ts ?? lastSeen ?? (/* @__PURE__ */ new Date(0)).toISOString(), status: "ok", agentId, attrs: { model } });
+          this.llmSpans.set(id, span);
+        }
+        span.end = ts ?? span.end;
+        span.durationMs = between(span.start, span.end);
+        const usage = usageOf(message.usage);
+        if (usage) span.attrs.usage = usage;
+        if (typeof message.stop_reason === "string") span.attrs.stopReason = message.stop_reason;
+        if (typeof entry.thinkingDurationMs === "number") span.attrs.thinkingMs = entry.thinkingDurationMs;
+        if (typeof entry.requestId === "string") span.attrs.request_id = entry.requestId;
+        if (message.stop_reason === "max_tokens") span.status = "error";
+        for (const block of Array.isArray(message.content) ? message.content : []) {
+          if (block?.type === "text" && typeof block.text === "string" && this.full) {
+            const prior = typeof span.attrs.text === "string" ? `${span.attrs.text}
+` : "";
+            span.attrs.text = this.content(prior + block.text);
+          }
+          if (block?.type === "thinking") span.attrs.thinking = true;
+          if (block?.type === "tool_use" && typeof block.id === "string") {
+            const raw = String(block.name ?? "tool");
+            const tool = displayToolName(raw);
+            const toolSpan = this.add({
+              id: `tool:${block.id}`,
+              parentId: parent(),
+              kind: "tool",
+              name: this.label(raw, block.input),
+              start: ts ?? span.start,
+              status: "running",
+              agentId,
+              attrs: { tool_name: tool, tool_use_id: block.id, llmId: span.id, ...this.full ? { input: this.content(typeof block.input === "object" ? JSON.stringify(block.input, null, 1) : String(block.input ?? "")) } : {} }
+            });
+            this.toolSpans.set(block.id, toolSpan);
+            this.taskEvents(tool, block.input, ts, toolSpan.id);
+            const path = block.input?.file_path ?? block.input?.notebook_path;
+            if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(tool) && typeof path === "string") toolSpan.attrs.file = path;
+          }
+        }
+        if (ts) lastSeen = ts;
+      }
+    }
+    if (main3) closeTurn(lastSeen);
+  }
+  /**
+   * A Codex rollout (`~/.codex/sessions/…/rollout-*.jsonl`). Its shape, as Codex 0.169 writes it:
+   *   event_msg task_started / task_complete     one turn, with duration_ms
+   *   response_item reasoning|message|function_call   what the model produced
+   *   token_usage_record                          closes one model request: response_id + exact usage
+   *   response_item function_call_output          a tool result (call_id)
+   *   session_meta / turn_context                 cwd, cli_version, model
+   * Like the Claude transcript it is undocumented, so every field is optional and unknown lines are skipped.
+   */
+  walkCodex(entries, rootId) {
+    let turn;
+    let llm;
+    let model;
+    let lastInput;
+    let lastSeen;
+    let requests = 0;
+    const parent = () => turn?.id ?? rootId;
+    const openLlm = (ts) => {
+      if (llm) return llm;
+      llm = this.add({ id: `llm:codex-${++requests}`, parentId: parent(), kind: "llm", name: model ?? "model", start: lastInput ?? ts ?? lastSeen ?? (/* @__PURE__ */ new Date(0)).toISOString(), status: "ok", attrs: { model } });
+      if (model) this.models.add(model);
+      return llm;
+    };
+    const closeTurn = (end, durationMs) => {
+      if (!turn) return;
+      turn.end = end ?? lastSeen;
+      turn.durationMs = durationMs ?? between(turn.start, turn.end);
+      if (turn.status === "running") turn.status = "ok";
+      turn = void 0;
+    };
+    for (const entry of entries) {
+      const ts = typeof entry.timestamp === "string" ? entry.timestamp : void 0;
+      const p = entry.payload ?? {};
+      if (entry.type === "session_meta") {
+        if (typeof p.cwd === "string") this.cwd ??= p.cwd;
+        if (typeof p.cli_version === "string") this.hostVersion ??= p.cli_version;
+        if (typeof p.git?.branch === "string") this.gitBranch = p.git.branch;
+      } else if (entry.type === "turn_context") {
+        if (typeof p.model === "string") model = p.model;
+        if (typeof p.cwd === "string") this.cwd ??= p.cwd;
+        if (typeof p.approval_policy === "string") this.permissionMode = p.approval_policy;
+      } else if (entry.type === "compacted") {
+        if (ts) this.events.push({ at: ts, kind: "compaction", message: "Context compacted", spanId: turn?.id });
+      } else if (entry.type === "event_msg" && p.type === "task_started") {
+        closeTurn(lastSeen);
+        this.turnCount++;
+        turn = this.add({ id: `turn:${this.turnCount}`, parentId: rootId, kind: "turn", status: "running", name: `Turn ${this.turnCount}`, start: ts ?? lastSeen ?? (/* @__PURE__ */ new Date(0)).toISOString(), attrs: { index: this.turnCount, trigger: p.turn_attribution?.turn_trigger } });
+        lastInput = ts;
+      } else if (entry.type === "event_msg" && p.type === "task_complete") {
+        if (llm) {
+          llm.end ??= ts;
+          llm.durationMs ??= between(llm.start, llm.end);
+          llm = void 0;
+        }
+        closeTurn(ts, typeof p.duration_ms === "number" ? p.duration_ms : void 0);
+      } else if (entry.type === "event_msg" && (p.type === "turn_aborted" || p.type === "error") && ts) {
+        this.events.push({ at: ts, kind: "error", message: `Turn ${p.type === "turn_aborted" ? "aborted" : "failed"}${p.reason ? `: ${p.reason}` : p.message ? `: ${String(p.message).slice(0, 200)}` : ""}`, spanId: turn?.id });
+        if (turn) turn.status = "error";
+      } else if (entry.type === "token_usage_record") {
+        const span = openLlm(ts);
+        span.end = ts ?? span.end;
+        span.durationMs = between(span.start, span.end);
+        const u = p.usage ?? {};
+        const n = (v) => typeof v === "number" && Number.isFinite(v) ? v : 0;
+        span.attrs.usage = { input_tokens: Math.max(0, n(u.input_tokens) - n(u.cached_input_tokens)), output_tokens: n(u.output_tokens), cache_read_tokens: n(u.cached_input_tokens), cache_creation_tokens: n(u.cache_write_input_tokens) };
+        if (n(u.reasoning_output_tokens)) span.attrs.reasoningTokens = n(u.reasoning_output_tokens);
+        if (typeof p.response_id === "string") span.attrs.request_id = p.response_id;
+        llm = void 0;
+      } else if (entry.type === "response_item") {
+        if (p.type === "message" && p.role === "user") {
+          const text3 = (Array.isArray(p.content) ? p.content : []).filter((c) => typeof c?.text === "string").map((c) => c.text).join("\n");
+          if (text3 && !ROLLOUT_INJECTED.test(text3) && turn && !turn.attrs?.prompt) {
+            turn.name = this.full ? clip2(firstLine(this.redactor.scrub(text3)), 90, false) : turn.name;
+            if (this.full) turn.attrs = { ...turn.attrs, prompt: this.content(text3) };
+            this.firstPrompt ??= text3;
+          }
+          lastInput = ts;
+        } else if (p.type === "reasoning") {
+          openLlm(ts).attrs.thinking = true;
+        } else if (p.type === "message" && p.role === "assistant") {
+          const text3 = (Array.isArray(p.content) ? p.content : []).filter((c) => typeof c?.text === "string").map((c) => c.text).join("\n");
+          const span = openLlm(ts);
+          if (text3 && this.full) span.attrs.text = this.content(typeof span.attrs.text === "string" ? `${span.attrs.text}
+${text3}` : text3);
+        } else if ((p.type === "function_call" || p.type === "custom_tool_call" || p.type === "local_shell_call") && typeof p.call_id === "string") {
+          const span = openLlm(ts);
+          let args = p.arguments ?? p.input ?? p.action;
+          if (typeof args === "string") {
+            try {
+              args = JSON.parse(args);
+            } catch {
+            }
+          }
+          const tool = codexToolName(p);
+          const labelInput = tool === "Bash" && args && typeof args === "object" ? { command: args.cmd ?? args.command } : args;
+          const toolSpan = this.add({
+            id: `tool:${p.call_id}`,
+            parentId: parent(),
+            kind: "tool",
+            name: this.label(tool, labelInput),
+            start: ts ?? span.start,
+            status: "running",
+            attrs: { tool_name: tool, tool_use_id: p.call_id, llmId: span.id, ...this.full ? { input: this.content(typeof args === "object" ? JSON.stringify(args, null, 1) : String(args ?? "")) } : {} }
+          });
+          this.toolSpans.set(p.call_id, toolSpan);
+          this.taskEvents(tool, args, ts, toolSpan.id);
+        } else if ((p.type === "function_call_output" || p.type === "custom_tool_call_output") && typeof p.call_id === "string") {
+          const span = this.toolSpans.get(p.call_id);
+          const text3 = typeof p.output === "string" ? p.output : Array.isArray(p.output) ? p.output.map((c) => typeof c?.text === "string" ? c.text : "").filter(Boolean).join("\n") : typeof p.output?.content === "string" ? p.output.content : "";
+          if (span) {
+            span.end = ts ?? span.end;
+            span.durationMs = between(span.start, span.end);
+            const exit = /Process exited with code (\d+)/.exec(text3);
+            const rejected = span.attrs?.tool_name === "TaskManage" && /"status"\s*:\s*"(failed|partial)"/.test(text3);
+            span.status = /blocked by (?:PreToolUse )?hook|\[TASK ENFORCEMENT/i.test(text3) ? "blocked" : exit && exit[1] !== "0" || p.output?.success === false || rejected ? "error" : "ok";
+            const out = this.content(text3);
+            if (out) span.attrs = { ...span.attrs, [span.status === "ok" ? "output" : "error"]: out };
+            if (exit) span.attrs = { ...span.attrs, exitCode: Number(exit[1]) };
+          }
+          lastInput = ts;
+        }
+      }
+      if (ts) lastSeen = ts;
+    }
+    closeTurn(lastSeen);
+  }
+  /** TaskManage creates/updates as instants on the timeline: what the agent committed to, and when. */
+  taskEvents(tool, input2, at, spanId) {
+    if (tool !== "TaskManage" || !at || !Array.isArray(input2?.operations)) return;
+    for (const op of input2.operations) {
+      if (op?.op === "create") this.events.push({ at, kind: "task", spanId, message: `Task created: ${clip2(String(op.subject ?? ""), 120)}`, attrs: { op: "create", status: op.status } });
+      else if (op?.op === "update" && (op.status || op.active)) {
+        const id = typeof op.taskId === "string" ? `#${op.taskId}` : "task";
+        this.events.push({ at, kind: "task", spanId, message: `${id} \u2192 ${op.status ?? "focused"}`, attrs: { op: "update", taskId: op.taskId, status: op.status } });
+      }
+    }
+  }
+  /** Fold hook records into the spans: exact durations, gate decisions, calls the transcript missed. */
+  mergeHooks(hooks, rootId) {
+    const pre = /* @__PURE__ */ new Map();
+    const post = /* @__PURE__ */ new Map();
+    const subagentStart = /* @__PURE__ */ new Map();
+    let turn = this.spans.filter((s) => s.kind === "turn").at(-1);
+    const hooksOnly = !this.spans.some((s) => s.kind === "turn" || s.kind === "llm");
+    let turnIndex = 0;
+    for (const h of hooks) {
+      if (h.event === "PreToolUse" && h.toolUseId) pre.set(h.toolUseId, h);
+      if ((h.event === "PostToolUse" || h.event === "PostToolUseFailure") && h.toolUseId) post.set(h.toolUseId, h);
+      if (h.event === "SubagentStart" && h.agentId) subagentStart.set(h.agentId, h);
+      if (h.permissionMode) this.permissionMode = h.permissionMode;
+      if (h.model) this.models.add(h.model);
+      if (h.event === "PreToolUse" && h.decision === "deny")
+        this.events.push({ at: h.at, kind: "gate.block", message: `${h.tool ? displayToolName(h.tool) : "Tool"} blocked: ${firstLine(h.reason ?? "")}`.slice(0, 300), spanId: h.toolUseId ? `tool:${h.toolUseId}` : void 0, attrs: this.full ? { reason: h.reason } : void 0 });
+      if (h.event === "PreCompact") this.events.push({ at: h.at, kind: "compaction", message: `Compaction started (${h.trigger ?? "auto"})` });
+      if (h.event === "Notification") this.events.push({ at: h.at, kind: "notification", message: h.message ?? h.notificationType ?? "notification", attrs: h.notificationType ? { type: h.notificationType } : void 0 });
+      if (h.event === "StopFailure") this.events.push({ at: h.at, kind: "error", message: `Turn failed: ${firstLine(h.error ?? "")}`.slice(0, 300) });
+      if (h.event === "PermissionDenied") this.events.push({ at: h.at, kind: "gate.block", message: `${h.tool ?? "Tool"} denied by permissions${h.reason ? `: ${h.reason}` : ""}`, spanId: h.toolUseId ? `tool:${h.toolUseId}` : void 0 });
+      if (h.event === "SessionStart" && h.source && h.source !== "startup") this.events.push({ at: h.at, kind: "session", message: `Session ${h.source}` });
+      if (h.event === "SessionEnd") this.events.push({ at: h.at, kind: "session", message: `Session ended (${h.reason ?? "exit"})` });
+      if (hooksOnly && h.event === "UserPromptSubmit" && !h.agentId) {
+        if (turn && !turn.end) {
+          turn.end = h.at;
+          turn.durationMs = between(turn.start, turn.end);
+          turn.status = "ok";
+        }
+        turnIndex++;
+        turn = this.add({ id: `turn:${turnIndex}`, parentId: rootId, kind: "turn", status: "running", start: h.at, name: this.full && h.prompt ? clip2(firstLine(h.prompt), 90, false) : `Turn ${turnIndex}`, attrs: { index: turnIndex, ...this.full && h.prompt ? { prompt: h.prompt } : {} } });
+        this.firstPrompt ??= h.prompt;
+      }
+      if (hooksOnly && (h.event === "Stop" || h.event === "StopFailure") && !h.agentId && turn && !turn.end) {
+        turn.end = h.at;
+        turn.durationMs = between(turn.start, turn.end);
+        turn.status = h.event === "StopFailure" ? "error" : "ok";
+      }
+      if (h.event === "SubagentStop" && h.agentId && !this.spans.some((s) => s.id === `agent:${h.agentId}`)) {
+        const started = subagentStart.get(h.agentId);
+        this.add({ id: `agent:${h.agentId}`, parentId: turn?.id ?? rootId, kind: "subagent", name: h.agentType ?? "subagent", start: started?.at ?? h.at, end: h.at, durationMs: between(started?.at, h.at), status: "ok", agentId: h.agentId, attrs: { agentType: h.agentType } });
+      }
+      if (hooksOnly && h.event === "PreToolUse" && h.toolUseId && !this.toolSpans.has(h.toolUseId)) {
+        const tool = displayToolName(h.tool ?? "tool");
+        const span = this.add({
+          id: `tool:${h.toolUseId}`,
+          parentId: h.agentId ? `agent:${h.agentId}` : turn?.id ?? rootId,
+          kind: "tool",
+          name: this.full && (h.label ?? h.input) ? `${tool} \xB7 ${clip2(firstLine(h.label ?? h.input ?? ""), 100, false)}` : tool,
+          start: h.at,
+          status: "running",
+          agentId: h.agentId,
+          attrs: { tool_name: tool, tool_use_id: h.toolUseId, ...this.full && h.input ? { input: h.input } : {} }
+        });
+        this.toolSpans.set(h.toolUseId, span);
+      }
+    }
+    if (hooksOnly && turn && !turn.end) {
+      turn.status = "running";
+    }
+    for (const [id, span] of this.toolSpans) {
+      const p = pre.get(id), q2 = post.get(id);
+      if (p?.decision === "deny") {
+        span.status = "blocked";
+        span.end ??= p.at;
+        span.durationMs = 0;
+        if (this.full && p.reason) span.attrs = { ...span.attrs, blockedReason: p.reason };
+        continue;
+      }
+      if (p?.context && this.full) span.attrs = { ...span.attrs, hookContext: p.context };
+      if (!q2) continue;
+      if (span.status === "running") span.status = q2.event === "PostToolUseFailure" ? q2.interrupted ? "interrupted" : "error" : "ok";
+      if (hooksOnly || !span.end) span.end = q2.at;
+      if (q2.durationMs !== void 0) {
+        span.durationMs = q2.durationMs;
+        span.attrs = { ...span.attrs, measured: "hook" };
+      } else span.durationMs ??= between(span.start, span.end);
+      if (hooksOnly && this.full) {
+        if (q2.output) span.attrs = { ...span.attrs, output: q2.output };
+        if (q2.error) span.attrs = { ...span.attrs, error: q2.error };
+      }
+    }
+    for (const span of this.spans) if (span.kind === "tool" && span.agentId && span.parentId !== `agent:${span.agentId}` && this.spans.some((s) => s.id === `agent:${span.agentId}`) && hooksOnly) span.parentId = `agent:${span.agentId}`;
+  }
+};
+function buildTrace(input2) {
+  const b = new Builder(input2);
+  const rootId = "session";
+  const root = b.add({ id: rootId, kind: "session", name: "Session", start: "", status: "ok" });
+  const entries = input2.transcript ? parseLines(input2.transcript) : [];
+  const codex = entries.some((e) => e.type === "session_meta" || e.type === "response_item" || e.type === "token_usage_record");
+  const basis = codex || entries.some((e) => e.type === "assistant" || e.type === "user") ? "transcript" : "hooks";
+  if (basis === "transcript") {
+    if (codex) b.walkCodex(entries, rootId);
+    else b.walk(entries, rootId);
+  }
+  for (const sub of input2.subagents ?? []) {
+    const subEntries = parseLines(sub.text);
+    if (!subEntries.length) continue;
+    const stamps2 = subEntries.map((e) => e.timestamp).filter((t) => typeof t === "string").sort();
+    const parentTool = sub.toolUseId ? b.toolSpans.get(sub.toolUseId) : void 0;
+    const span = b.add({
+      id: `agent:${sub.agentId}`,
+      parentId: parentTool?.id ?? rootId,
+      kind: "subagent",
+      name: [sub.agentType, sub.description ? clip2(b.redactor.scrub(sub.description), 80, false) : void 0].filter(Boolean).join(" \xB7 ") || "subagent",
+      start: stamps2[0] ?? "",
+      end: stamps2.at(-1),
+      durationMs: between(stamps2[0], stamps2.at(-1)),
+      status: "ok",
+      agentId: sub.agentId,
+      attrs: { agentType: sub.agentType, description: b.preview(sub.description, 200) }
+    });
+    b.walk(subEntries, span.id, sub.agentId);
+    if (b.spans.some((s) => s.parentId === span.id && s.kind === "tool" && s.status === "error")) span.attrs.hadErrors = true;
+  }
+  b.mergeHooks(input2.hooks, rootId);
+  const stamps = [...b.spans.flatMap((s) => [s.start, s.end]), ...b.events.map((e) => e.at), ...input2.hooks.map((h) => h.at)].filter((t) => !!t && ms(t) !== void 0).sort();
+  const now = (input2.now ?? /* @__PURE__ */ new Date()).toISOString();
+  root.start = stamps[0] ?? now;
+  root.end = stamps.at(-1) ?? now;
+  root.durationMs = between(root.start, root.end) ?? 0;
+  for (const span of b.spans) if (!span.start) span.start = root.start;
+  b.events.sort((x, y) => (ms(x.at) ?? 0) - (ms(y.at) ?? 0));
+  const tokens = emptyUsage();
+  const tokensByModel = {};
+  const tools = /* @__PURE__ */ new Map();
+  const files = /* @__PURE__ */ new Set();
+  let llmMs = 0, toolMs = 0;
+  for (const span of b.spans) {
+    if (span.kind === "llm") {
+      const usage = span.attrs?.usage;
+      if (usage) {
+        addUsage(tokens, usage);
+        const model = String(span.attrs?.model ?? "unknown");
+        addUsage(tokensByModel[model] ??= emptyUsage(), usage);
+      }
+      llmMs += span.durationMs ?? 0;
+    }
+    if (span.kind === "tool") {
+      if (span.status !== "running") span.attrs = { ...span.attrs, success: span.status === "ok" };
+      const name = String(span.attrs?.tool_name ?? span.name);
+      const stat = tools.get(name) ?? { name, calls: 0, errors: 0, blocked: 0, totalMs: 0 };
+      stat.calls++;
+      if (span.status === "error" || span.status === "interrupted") stat.errors++;
+      if (span.status === "blocked") stat.blocked++;
+      stat.totalMs += span.durationMs ?? 0;
+      toolMs += span.durationMs ?? 0;
+      tools.set(name, stat);
+      if (typeof span.attrs?.file === "string") files.add(span.attrs.file);
+    }
+  }
+  const toolSpans = b.spans.filter((s) => s.kind === "tool");
+  const cwd = b.cwd;
+  const relative = (p) => cwd && p.startsWith(cwd + "/") ? p.slice(cwd.length + 1) : p;
+  let spans = b.spans;
+  const maxSpans = input2.maxSpans ?? 5e3;
+  if (spans.length > maxSpans) {
+    b.truncated.push(`${spans.length - maxSpans} spans past the ${maxSpans}-span limit were dropped`);
+    spans = spans.slice(0, maxSpans);
+  }
+  const title = b.title ?? (b.firstPrompt ? clip2(firstLine(b.redactor.scrub(b.firstPrompt)), 90, false) : void 0);
+  const trace = {
+    schema: TRACE_SCHEMA,
+    id: `${input2.sessionId}@${root.end}`,
+    createdAt: now,
+    source: { host: input2.host ?? (codex ? "codex" : "claude-code"), hostVersion: b.hostVersion, plugin: input2.plugin, detail: input2.detail ?? "full" },
+    session: {
+      id: input2.sessionId,
+      title: (input2.detail ?? "full") === "full" ? title : void 0,
+      cwd,
+      gitBranch: b.gitBranch,
+      permissionMode: b.permissionMode,
+      models: [...b.models],
+      start: root.start,
+      end: root.end,
+      durationMs: root.durationMs ?? 0,
+      basis
+    },
+    totals: {
+      turns: b.spans.filter((s) => s.kind === "turn").length,
+      llmCalls: b.spans.filter((s) => s.kind === "llm").length,
+      toolCalls: toolSpans.length,
+      toolErrors: toolSpans.filter((s) => s.status === "error" || s.status === "interrupted").length,
+      blocked: toolSpans.filter((s) => s.status === "blocked").length,
+      subagents: b.spans.filter((s) => s.kind === "subagent").length,
+      compactions: b.events.filter((e) => e.kind === "compaction" && !/started/.test(e.message)).length || b.events.filter((e) => e.kind === "compaction").length,
+      tokens,
+      tokensByModel,
+      llmMs,
+      toolMs,
+      filesTouched: [...files].map(relative).sort()
+    },
+    tools: [...tools.values()].sort((x, y) => y.calls - x.calls || y.totalMs - x.totalMs),
+    tasks: input2.tasks ?? [],
+    issues: [...new Set((input2.tasks ?? []).map((t) => t.issue).filter((i) => !!i))],
+    spans,
+    events: b.events,
+    ...b.truncated.length ? { truncated: b.truncated } : {}
+  };
+  return fitTrace(trace);
+}
+var CONTENT_FIELDS = ["output", "input", "text", "error", "prompt", "hookContext", "blockedReason"];
+var FIT_CAPS = [64e3, 16e3, 4e3, 1e3, 300];
+function fitTrace(trace, limit = 8 * 1024 * 1024) {
+  const size = () => Buffer.byteLength(JSON.stringify(trace));
+  if (size() <= limit) return trace;
+  for (const cap of FIT_CAPS) {
+    let trimmed2 = 0;
+    for (const span of trace.spans) for (const field of CONTENT_FIELDS) {
+      const value = span.attrs?.[field];
+      if (typeof value === "string" && value.length > cap) {
+        span.attrs[field] = clipMiddle(value, cap);
+        trimmed2++;
+      }
+    }
+    if (trimmed2) (trace.truncated ??= []).push(`${trimmed2} content fields over ${cap.toLocaleString("en-US")} chars trimmed (head and tail kept) to fit the upload limit`);
+    if (size() <= limit) return trace;
+  }
+  while (size() > limit && trace.spans.length > 1) {
+    const drop = Math.ceil(trace.spans.length / 10);
+    trace.spans = trace.spans.slice(0, trace.spans.length - drop);
+    trace.truncated.push(`${drop} trailing spans dropped to fit the upload limit`);
+  }
+  return trace;
+}
+
+// src/trace/collect.ts
+var PLUGIN_VERSION = "0.4.1";
+var HOJA_TASK_ENTRY2 = "hoja-task-link";
+var TASK_STATE_ENTRY = "pi-swarm-task-state";
+function hojaLinks(entries) {
+  const links = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    if (entry?.customType !== HOJA_TASK_ENTRY2) continue;
+    const d = entry.data;
+    if (d?.taskId == null) continue;
+    if (d.state === "linked" && typeof d.identifier === "string") links.set(String(d.taskId), d.identifier);
+  }
+  return links;
+}
+function journalTasks(entries) {
+  const last = [...entries].reverse().find((e) => e?.customType === TASK_STATE_ENTRY);
+  const tasks = last?.data?.tasks;
+  return Array.isArray(tasks) ? tasks : tasks && typeof tasks === "object" ? Object.values(tasks) : [];
+}
+function traceTasks(tasks, links) {
+  return tasks.filter((t) => t && t.status !== "deleted").map((t) => {
+    const answered = new Set((t.answers ?? []).map((a) => a?.question));
+    return {
+      id: String(t.id),
+      subject: String(t.subject ?? ""),
+      status: String(t.status ?? ""),
+      ...t.parentTaskId ? { parentId: String(t.parentTaskId) } : {},
+      ...links.get(String(t.id)) ? { issue: links.get(String(t.id)) } : {},
+      ...Array.isArray(t.questions) && t.questions.length ? { questions: t.questions.map((q2) => ({ id: String(q2.id), text: String(q2.text ?? ""), answered: answered.has(q2.id) })) } : {}
+    };
+  });
+}
+function readSubagents(transcriptPath) {
+  if (!transcriptPath) return [];
+  const dir = join5(dirname3(transcriptPath), basename(transcriptPath, ".jsonl"), "subagents");
+  if (!existsSync4(dir)) return [];
+  const out = [];
+  for (const file of readdirSync(dir).filter((f) => /^agent-.+\.jsonl$/.test(f)).sort()) {
+    const agentId = file.slice("agent-".length, -".jsonl".length);
+    let meta = {};
+    try {
+      meta = JSON.parse(readFileSync6(join5(dir, `agent-${agentId}.meta.json`), "utf8"));
+    } catch {
+    }
+    try {
+      out.push({ agentId, text: readFileSync6(join5(dir, file), "utf8"), toolUseId: meta.toolUseId, agentType: meta.agentType, description: meta.description });
+    } catch {
+    }
+  }
+  return out;
+}
+function persistedReader(transcriptPath) {
+  if (!transcriptPath) return void 0;
+  const root = resolve3(dirname3(transcriptPath), basename(transcriptPath, ".jsonl"), "tool-results") + sep2;
+  return (path) => {
+    const target2 = resolve3(path);
+    if (!target2.startsWith(root) || target2.slice(root.length).includes(sep2)) return void 0;
+    try {
+      if (statSync4(target2).size > FIELD_CAP * 4) return readFileSync6(target2, "utf8").slice(0, FIELD_CAP * 4);
+      return readFileSync6(target2, "utf8");
+    } catch {
+      return void 0;
+    }
+  };
+}
+function transcriptFromHooks(records) {
+  return [...records].reverse().find((r) => r.transcriptPath)?.transcriptPath;
+}
+function collectTrace(options) {
+  const hooks = readHookRecords(options.dataDir, options.sessionId);
+  const transcriptPath = options.transcriptPath || transcriptFromHooks(hooks);
+  let transcript;
+  try {
+    if (transcriptPath) transcript = readFileSync6(transcriptPath, "utf8");
+  } catch {
+  }
+  const journal = options.journal ?? [];
+  const links = hojaLinks(journal);
+  return buildTrace({
+    sessionId: options.sessionId,
+    transcript,
+    subagents: readSubagents(transcriptPath),
+    hooks,
+    tasks: traceTasks(options.tasks ?? journalTasks(journal), links),
+    plugin: `hoja@${PLUGIN_VERSION}`,
+    host: options.host ?? (hostOf() === "codex" ? "codex" : void 0),
+    detail: options.detail,
+    redactor: new Redactor(options.env ?? process.env),
+    now: options.now,
+    readPersisted: persistedReader(transcriptPath)
+  });
+}
+function saveTrace(dataDir2, trace) {
+  const path = tracePath(dataDir2, trace.session.id);
+  mkdirSync4(tracesDir(dataDir2), { recursive: true, mode: 448 });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync2(tmp, JSON.stringify(trace), { mode: 384 });
+  renameSync(tmp, path);
+  return path;
+}
+
+// src/trace/render.ts
+function formatDuration(ms2) {
+  if (ms2 == null || !Number.isFinite(ms2)) return "\u2013";
+  if (ms2 < 1e3) return `${Math.round(ms2)}ms`;
+  const s = ms2 / 1e3;
+  if (s < 60) return `${s < 10 ? s.toFixed(1) : Math.round(s)}s`;
+  const m = Math.floor(s / 60), rs = Math.round(s % 60);
+  if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return rm ? `${h}h ${rm}m` : `${h}h`;
+}
+function formatTokens(n) {
+  if (n < 1e3) return String(n);
+  if (n < 1e6) return `${(n / 1e3).toFixed(n < 1e4 ? 1 : 0)}k`;
+  return `${(n / 1e6).toFixed(n < 1e7 ? 2 : 1)}M`;
+}
+var bar = (part, whole, width = 18) => {
+  const n = whole > 0 ? Math.max(part > 0 ? 1 : 0, Math.round(part / whole * width)) : 0;
+  return "\u2588".repeat(n) + "\u2591".repeat(width - n);
+};
+var icon = (s) => s === "ok" ? "\u2713" : s === "blocked" ? "\u2298" : s === "running" ? "\u2026" : "\u2717";
+function renderSummary(trace, extra = {}) {
+  const t = trace.totals;
+  const lines = [];
+  lines.push(`Session trace${trace.session.title ? ` \xB7 ${trace.session.title}` : ""}`);
+  lines.push(`  ${formatDuration(trace.session.durationMs)} \xB7 ${t.turns} turn${t.turns === 1 ? "" : "s"} \xB7 ${t.llmCalls} model calls \xB7 ${t.toolCalls} tool calls${t.toolErrors ? ` (${t.toolErrors} failed)` : ""}${t.blocked ? ` \xB7 ${t.blocked} blocked by the gate` : ""}${t.subagents ? ` \xB7 ${t.subagents} subagents` : ""}${t.compactions ? ` \xB7 ${t.compactions} compactions` : ""}`);
+  if (trace.session.models.length) lines.push(`  Model     ${trace.session.models.join(", ")}`);
+  if (totalTokens(t.tokens)) lines.push(`  Tokens    ${formatTokens(totalTokens(t.tokens))} total \xB7 in ${formatTokens(t.tokens.input_tokens)} \xB7 out ${formatTokens(t.tokens.output_tokens)} \xB7 cache read ${formatTokens(t.tokens.cache_read_tokens)} \xB7 cache write ${formatTokens(t.tokens.cache_creation_tokens)}`);
+  const busy = t.llmMs + t.toolMs;
+  if (busy) {
+    const parallel = busy > trace.session.durationMs * 1.05 ? "  (summed; subagents and parallel calls overlap)" : "";
+    lines.push(`  Waiting   model ${bar(t.llmMs, busy, 12)} ${formatDuration(t.llmMs)} \xB7 tools ${bar(t.toolMs, busy, 12)} ${formatDuration(t.toolMs)}${parallel}`);
+  }
+  if (trace.tools.length) {
+    lines.push("", "  Tool            calls  failed  blocked     time");
+    for (const s of trace.tools.slice(0, 8))
+      lines.push(`  ${s.name.padEnd(15).slice(0, 15)} ${String(s.calls).padStart(5)}  ${String(s.errors || "").padStart(6)}  ${String(s.blocked || "").padStart(7)}  ${formatDuration(s.totalMs).padStart(7)}`);
+    if (trace.tools.length > 8) lines.push(`  \u2026 ${trace.tools.length - 8} more`);
+  }
+  const slow = trace.spans.filter((s) => s.kind === "tool" && s.durationMs).sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0)).slice(0, 3);
+  if (slow.length) {
+    lines.push("", "  Slowest");
+    for (const s of slow) lines.push(`  ${icon(s.status)} ${formatDuration(s.durationMs).padStart(7)}  ${s.name.slice(0, 90)}`);
+  }
+  const failed2 = trace.spans.filter((s) => s.kind === "tool" && (s.status === "error" || s.status === "blocked")).slice(-3);
+  if (failed2.length) {
+    lines.push("", "  Recent failures");
+    for (const s of failed2) lines.push(`  ${icon(s.status)} ${s.name.slice(0, 90)}`);
+  }
+  if (t.filesTouched.length) lines.push("", `  Files     ${t.filesTouched.slice(0, 6).join(", ")}${t.filesTouched.length > 6 ? ` +${t.filesTouched.length - 6}` : ""}`);
+  if (trace.issues.length) lines.push(`  Issues    ${trace.issues.join(", ")}`);
+  for (const u of extra.uploads ?? []) lines.push(`  Uploaded  \u2192 ${u.issue} at ${u.at.slice(11, 16)} UTC`);
+  if (extra.path) lines.push(`  Saved     ${extra.path}`);
+  if (trace.truncated?.length) lines.push(`  Note      ${trace.truncated.join("; ")}`);
+  return lines.join("\n");
+}
+
+// src/trace/upload.ts
+import { existsSync as existsSync5, readFileSync as readFileSync7, writeFileSync as writeFileSync3, mkdirSync as mkdirSync5 } from "node:fs";
+import { join as join6 } from "node:path";
+var HOSTS = { "claude-code": { slug: "claude-code", name: "Claude Code" }, codex: { slug: "codex", name: "Codex" } };
+var hostOf2 = (trace) => HOSTS[trace.source.host] ?? { slug: trace.source.host.replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "agent", name: trace.source.host };
+function traceFileName(trace) {
+  const stamp = trace.session.end.replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").replace("T", "-");
+  return `${hostOf2(trace).slug}-${trace.session.id.slice(0, 8)}-${stamp}.trace.json`;
+}
+function traceSubtitle(trace) {
+  const t = trace.totals;
+  return [
+    `${hostOf2(trace).name} trace`,
+    formatDuration(trace.session.durationMs),
+    `${t.turns} turn${t.turns === 1 ? "" : "s"}`,
+    `${t.toolCalls} tool call${t.toolCalls === 1 ? "" : "s"}`,
+    t.toolErrors ? `${t.toolErrors} failed` : "",
+    t.blocked ? `${t.blocked} blocked` : "",
+    t.subagents ? `${t.subagents} subagent${t.subagents === 1 ? "" : "s"}` : "",
+    totalTokens(t.tokens) ? `${formatTokens(totalTokens(t.tokens))} tokens` : ""
+  ].filter(Boolean).join(" \xB7 ");
+}
+function traceTitle(trace, reason) {
+  const slug = hostOf2(trace).slug;
+  return traceFileName(trace).replace(`${slug}-`, `${slug}${reason ? `-${reason}` : ""}-`);
+}
+var ATTACH = `mutation HojaTraceAttach($input: AttachmentCreateInput!) { attachmentCreate(input: $input) { success attachment { id url } } }`;
+async function uploadTrace(trace, issue, target2, reason) {
+  const fetchImpl = target2.fetchImpl ?? fetch;
+  const origin = new URL(target2.graphqlUrl).origin;
+  const body = JSON.stringify(trace);
+  const name = traceTitle(trace, reason);
+  const auth = { authorization: `Bearer ${target2.token}` };
+  const signal = () => AbortSignal.timeout(target2.timeoutMs ?? 3e4);
+  const form = new FormData();
+  form.append("file", new Blob([body], { type: "application/json" }), name);
+  const uploaded = await fetchImpl(`${origin}/api/uploads`, { method: "POST", headers: auth, body: form, signal: signal() });
+  const text3 = await uploaded.text();
+  if (uploaded.status === 401 || uploaded.status === 403) throw new Error(`Hoja rejected the token for uploads (HTTP ${uploaded.status}). Check HOJA_TOKEN.`);
+  if (uploaded.status === 413) throw new Error(`the trace (${Math.round(body.length / 1024)} KB) is larger than Hoja's upload limit`);
+  if (uploaded.status >= 400) throw new Error(`Hoja upload failed: HTTP ${uploaded.status} ${text3.slice(0, 200)}`);
+  let url;
+  try {
+    url = JSON.parse(text3)?.url;
+  } catch {
+  }
+  if (typeof url !== "string" || !url) throw new Error("Hoja upload answered without a file url");
+  const subtitle = traceSubtitle(trace);
+  const attached = await fetchImpl(target2.graphqlUrl, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    signal: signal(),
+    body: JSON.stringify({ query: ATTACH, variables: { input: { issueId: issue, url, title: name, subtitle } } })
+  });
+  const answer = await attached.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(answer);
+  } catch {
+    throw new Error(`Hoja attachmentCreate answered HTTP ${attached.status}`);
+  }
+  if (parsed?.errors?.length) throw new Error(`Hoja attachmentCreate: ${parsed.errors[0]?.message ?? "error"}`);
+  if (!parsed?.data?.attachmentCreate?.success) throw new Error(`Hoja did not attach the trace to ${issue} (issue not found or not visible to this token)`);
+  return { issue, url, attachmentId: parsed.data.attachmentCreate.attachment?.id, title: name, subtitle, bytes: body.length };
+}
+var ledgerPath = (dataDir2, sessionId) => join6(tracesDir(dataDir2), `${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.uploads.json`);
+function readLedger(dataDir2, sessionId) {
+  const path = ledgerPath(dataDir2, sessionId);
+  if (!existsSync5(path)) return [];
+  try {
+    const v = JSON.parse(readFileSync7(path, "utf8"));
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+function appendLedger(dataDir2, sessionId, entry) {
+  mkdirSync5(tracesDir(dataDir2), { recursive: true, mode: 448 });
+  writeFileSync3(ledgerPath(dataDir2, sessionId), JSON.stringify([...readLedger(dataDir2, sessionId), entry], null, 1), { mode: 384 });
+}
+
+// src/trace/service.ts
+var ISSUE = /^[A-Za-z0-9]+-\d+$/;
+var TraceService = class {
+  constructor(options) {
+    this.options = options;
+  }
+  options;
+  get env() {
+    return this.options.env ?? process.env;
+  }
+  build() {
+    const s = this.options.session();
+    if (!s.id) return void 0;
+    return collectTrace({ dataDir: this.options.dataDir, sessionId: s.id, transcriptPath: s.transcriptPath, tasks: s.tasks, journal: s.entries, detail: this.options.detail, env: this.env });
+  }
+  /** Credentials problem in words, or "" when uploads can run. */
+  uploadProblem() {
+    if (!resolveHojaUrl(this.env)) return "no Hoja endpoint (set hoja_api_url or HOJA_API_URL)";
+    if (!resolveHojaToken(this.env)) return "no Hoja token (set hoja_token or HOJA_TOKEN)";
+    return "";
+  }
+  async upload(issue, reason, taskId, trace = this.build()) {
+    if (!trace) throw new Error("no session is bound yet");
+    const problem = this.uploadProblem();
+    if (problem) throw new Error(problem);
+    saveTrace(this.options.dataDir, trace);
+    const result = await uploadTrace(trace, issue, { graphqlUrl: resolveHojaUrl(this.env), token: resolveHojaToken(this.env), fetchImpl: this.options.fetchImpl }, reason);
+    appendLedger(this.options.dataDir, trace.session.id, { issue, at: (/* @__PURE__ */ new Date()).toISOString(), url: result.url, attachmentId: result.attachmentId, reason, taskId });
+    this.options.log?.(`trace uploaded to ${issue} (${result.bytes} bytes)`);
+    return result;
+  }
+  /** Completed tasks linked to an issue whose trace has not been uploaded in this session. */
+  pendingCompletions() {
+    const s = this.options.session();
+    if (!s.id) return [];
+    const links = hojaLinks(s.entries);
+    const done = new Set(readLedger(this.options.dataDir, s.id).filter((e) => e.reason === "completion").map((e) => `${e.taskId}:${e.issue}`));
+    return s.tasks.filter((t) => t?.status === "completed" && links.has(String(t.id))).map((t) => ({ taskId: String(t.id), issue: links.get(String(t.id)) })).filter((p) => !done.has(`${p.taskId}:${p.issue}`));
+  }
+  /** After a TaskManage call: upload the trace to each issue whose task just completed. Lines for the tool result. */
+  async afterTaskManage() {
+    if (this.options.upload === "off" || this.options.upload === "manual") return [];
+    const pending = this.pendingCompletions();
+    if (!pending.length || this.uploadProblem()) return [];
+    const trace = this.build();
+    const lines = [];
+    const s = this.options.session();
+    const first = !!s.id && !readLedger(this.options.dataDir, s.id).some((e) => e.url);
+    for (const p of pending) {
+      try {
+        const r = await this.upload(p.issue, "completion", p.taskId, trace);
+        lines.push(`Hoja trace: attached this session's trace to ${p.issue} (${r.subtitle}).`);
+        if (first && lines.length === 1) lines.push(this.contentNotice());
+      } catch (error) {
+        lines.push(`Hoja trace: could not attach the trace to ${p.issue}: ${error.message}. Run /hoja:trace upload ${p.issue} to retry.`);
+        const s2 = this.options.session();
+        if (s2.id) appendLedger(this.options.dataDir, s2.id, { issue: p.issue, at: (/* @__PURE__ */ new Date()).toISOString(), url: "", reason: "completion", taskId: p.taskId });
+      }
+    }
+    return lines;
+  }
+  contentNotice() {
+    return this.options.detail === "full" ? "It includes full content (prompts, tool inputs and outputs, model responses) with secrets scrubbed; set trace_detail to metadata to send only timings, statuses and token counts." : "It includes timings, statuses and token counts only (trace_detail: metadata).";
+  }
+  /** `/hoja:trace [summary|upload [ISSUE]|path]` and the `hoja_trace` tool share this. */
+  async run(args) {
+    const [verb = "summary", target2] = args.trim().split(/\s+/).filter(Boolean);
+    const trace = this.build();
+    if (!trace) return "No session is bound yet; send a prompt first.";
+    const path = saveTrace(this.options.dataDir, trace);
+    const uploads = readLedger(this.options.dataDir, trace.session.id).filter((e) => e.url);
+    if (verb === "path") return path;
+    if (verb === "upload") {
+      const issues = target2 ? [target2.toUpperCase()] : trace.issues;
+      if (!issues.length) return "No issue to attach the trace to: this session's tasks are not linked to Hoja issues. Name one: /hoja:trace upload HOJA-123";
+      const bad = issues.find((i) => !ISSUE.test(i));
+      if (bad) return `"${bad}" is not an issue identifier (expected TEAM-123).`;
+      const out = [];
+      for (const issue of issues) {
+        try {
+          const r = await this.upload(issue, "manual", void 0, trace);
+          out.push(`\u2713 ${issue}: ${r.title} \u2014 ${r.subtitle}`);
+        } catch (error) {
+          out.push(`\u2717 ${issue}: ${error.message}`);
+        }
+      }
+      return [...out, this.contentNotice()].join("\n");
+    }
+    const footer = this.options.upload === "off" ? "Uploads are off (trace_upload)." : this.uploadProblem() ? `Uploads unavailable: ${this.uploadProblem()}.` : this.options.upload === "manual" ? "Uploads are manual: /hoja:trace upload [ISSUE]." : `Uploads: automatic on ${this.options.upload === "session-end" ? "task completion and session end" : "task completion"}; now: /hoja:trace upload [ISSUE].`;
+    return `${renderSummary(trace, { path, uploads })}
+
+${footer}`;
+  }
+};
+
 // src/runtime.ts
 var TASK_MANAGER_SYMBOL = /* @__PURE__ */ Symbol.for("pi-swarm-task-manager");
 var alias = (name) => typeof name === "string" && canonicalToolName(name) !== name ? canonicalToolName(name) : void 0;
@@ -5812,20 +6956,51 @@ function createRuntime(options) {
   const shim = new PiShim(options);
   const manager = registerTaskManage(shim.api, taskManageRenderers, { workspaceRoot: options.cwd, toolAliases });
   globalThis[TASK_MANAGER_SYMBOL] = manager;
-  const bridge = new HookBridge(shim, manager, options);
+  const tracing = options.trace?.enabled !== false;
+  const recorder = tracing ? new TraceRecorder({ dataDir: options.dataDir, detail: options.trace?.detail, log: options.log }) : void 0;
+  const bridge = new HookBridge(shim, manager, { ...options, recorder });
+  const traces = new TraceService({
+    dataDir: options.dataDir,
+    upload: tracing ? options.trace?.upload ?? "completion" : "off",
+    detail: options.trace?.detail ?? "full",
+    // Uploads go through the same credential as everything else: a CLI sign-in's token is refreshed before expiry
+    // and once after a 401 (src/credentials.ts).
+    env: options.trace?.env,
+    fetchImpl: options.trace?.fetchImpl ?? authFetch(credentials),
+    log: options.log,
+    session: () => ({ id: shim.sessionId, transcriptPath: shim.transcript.path, entries: shim.branch(), tasks: manager.snapshot().tasks })
+  });
   registerTaskHooks(shim.api, manager, { enforcementMode: "off", silent: true });
   shim.api.registerCommand("tasks", { description: "Show the read-only task board", handler: () => taskBoard(manager) });
   if (options.hoja !== false) {
     const client = options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials) });
     registerHojaMode(shim.api, wrapHojaWriter(client, () => manager.snapshot().tasks, options.log));
   }
+  shim.api.on("tool_result", async (event) => {
+    if (event?.toolName !== "TaskManage" || event.isError) return void 0;
+    const lines = await traces.afterTaskManage();
+    return lines.length ? { content: [...event.content ?? [], { type: "text", text: lines.join("\n") }] } : void 0;
+  });
+  shim.api.registerCommand("trace", {
+    description: "Session trace: summary (default), upload [ISSUE], path",
+    handler: (args) => traces.run(args)
+  });
+  shim.api.registerTool({
+    name: "hoja_trace",
+    label: "Hoja session trace",
+    description: `This session's trace (turns, model calls with token usage, every tool call with its duration and outcome, gate blocks, subagents). action "summary" (default, read-only) returns a readable summary and saves the hoja.trace/v1 JSON locally; "path" returns that file's path; "upload" attaches the trace to a Hoja issue (\`issue\`, e.g. HOJA-123, or every issue this session's tasks are linked to). Completed tasks linked to an issue get their trace attached automatically, so call upload only when asked or for an unlinked issue.`,
+    parameters: { type: "object", properties: { action: { type: "string", enum: ["summary", "path", "upload"] }, issue: { type: "string", description: "Issue identifier for upload, e.g. HOJA-123" } }, additionalProperties: false },
+    execute: async (_id, params) => ({ content: [{ type: "text", text: await traces.run(`${params?.action ?? "summary"} ${params?.issue ?? ""}`) }], details: {} })
+  });
   const setupReport = async (ctx = shim.ctx()) => {
     const hoja = shim.commands.get("hoja");
     const before = shim.notifications.length;
     if (hoja) await hoja.handler("status", ctx);
     const mode = shim.notifications.slice(before).map((n) => n.message).join(" ");
     shim.notifications.length = before;
-    return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...await hojaDoctor(), mode && `Hoja mode: ${mode}`].filter(Boolean).join("\n");
+    const detail = (options.trace?.detail ?? "full") === "full" ? "full (whole prompts, tool inputs and outputs, secrets scrubbed; trace_detail: metadata to opt out)" : "metadata (timings, statuses, token counts)";
+    const trace = tracing ? `Session traces: upload ${options.trace?.upload ?? "completion"}, detail ${detail}${traces.uploadProblem() ? ` (uploads unavailable: ${traces.uploadProblem()})` : ""}` : "Session traces: off";
+    return [`Task enforcement: ${options.enforcementMode ?? "block"}`, ...await hojaDoctor(), mode && `Hoja mode: ${mode}`, trace].filter(Boolean).join("\n");
   };
   shim.api.registerCommand("setup", {
     description: "Check Hoja credentials, endpoints, project and task enforcement",
@@ -5838,7 +7013,7 @@ function createRuntime(options) {
     parameters: { type: "object", properties: {}, additionalProperties: false },
     execute: async (_id, _params, _signal, _onUpdate, ctx) => ({ content: [{ type: "text", text: await setupReport(ctx ?? shim.ctx()) }], details: {} })
   });
-  return { shim, manager, bridge };
+  return { shim, manager, bridge, traces };
 }
 async function hojaDoctor(env = process.env, probe = fetch) {
   const graphql = resolveHojaUrl(env);
@@ -5874,8 +7049,8 @@ var plain = { fg: (_c, t) => t, bold: (t) => t, dim: (t) => t };
 function taskBoard(manager, width = 100) {
   const tasks = manager.snapshot().tasks.filter((t) => t.status !== "deleted");
   const widget = taskWidgetRenderer(tasks, plain).render(width);
-  const icon = (s) => s === "completed" ? "\u2713" : s === "in_progress" ? "\u25C9" : "\u25CB";
-  const all = tasks.map((t) => `  ${icon(t.status)} #${t.id}${t.parentTaskId ? ` (child of #${t.parentTaskId})` : ""} ${t.subject} [${t.status}${t.active ? ", active" : ""}]`);
+  const icon2 = (s) => s === "completed" ? "\u2713" : s === "in_progress" ? "\u25C9" : "\u25CB";
+  const all = tasks.map((t) => `  ${icon2(t.status)} #${t.id}${t.parentTaskId ? ` (child of #${t.parentTaskId})` : ""} ${t.subject} [${t.status}${t.active ? ", active" : ""}]`);
   return [...widget, "", "All tasks:", ...all.length ? all : ["  (none)"]].join("\n");
 }
 
@@ -5901,9 +7076,10 @@ async function main2() {
   applyCredentials();
   let input2 = {};
   try {
-    input2 = JSON.parse(readFileSync5(0, "utf8") || "{}");
+    input2 = JSON.parse(readFileSync8(0, "utf8") || "{}");
   } catch {
   }
+  new TraceRecorder({ dataDir: dataDir(), detail: traceDetail() }).record(input2.session_id, "SessionStart", input2);
   const additionalContext = await sessionContext(input2);
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext } }));
 }
