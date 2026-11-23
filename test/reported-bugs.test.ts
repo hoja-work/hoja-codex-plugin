@@ -131,7 +131,10 @@ describe("item 1: slash commands are answered locally, whatever the host calls t
 		expect(setup.decision).toBe("block");
 		expect(setup.reason).toContain("GraphQL endpoint:");
 		// An ordinary prompt that merely starts with the plugin name is not hijacked.
-		expect(await f.hook("UserPromptSubmit", { prompt: "hoja: how do I file an issue?" })).toEqual({});
+		// (It is a real user message, so it only gets the work-registration line, never a block.)
+		const plain: any = await f.hook("UserPromptSubmit", { prompt: "hoja: how do I file an issue?" });
+		expect(plain.decision).toBeUndefined();
+		expect(plain.hookSpecificOutput?.additionalContext ?? "").not.toContain("All tasks:");
 	});
 
 	it("exposes the same report as a read-only tool for the .md fallback", async () => {

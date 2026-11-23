@@ -11,6 +11,7 @@
  *   tool_result                      PostToolUse(+Failure)    postTool (context queued for the turn)
  *   turn_end (one hook message)      PostToolBatch            flushTurn → additionalContext
  *   agent_before_settle (gate resume)Stop                     decision:"block" + continuation | systemMessage
+ *   agent_before_settle (registration) Stop                    once per turn: reconcile / register the turn's work
  *   session_shutdown                 SessionEnd
  *   registerCommand                  UserPromptExpansion      decision:"block" + reason (local command, no model turn)
  *
@@ -27,6 +28,7 @@ import { formatHookContext } from "../vendor/trebol/.pi/lib/policy/swarm-annoyan
 import { sleepBlockReason } from "../vendor/trebol/.pi/lib/policy/swarm-sleep-blocker.ts";
 import { STDIN_CONFLICT_HOOK_NAME, StdinConflictHook } from "../vendor/trebol/.pi/lib/runtime/swarm-stdin-conflict.ts";
 import { TaskGateResumeBudget, evaluateTaskGateResume } from "../vendor/trebol/.pi/lib/runtime/task-gate-resume.ts";
+import { WORK_REGISTRATION_HOOK, WorkRegistrationPolicy } from "../vendor/trebol/.pi/lib/runtime/work-registration.ts";
 import type { TaskManager } from "../vendor/trebol/packages/tools/taskmanage/src/task-manage.ts";
 import { canonicalToolName, isOwnTool, type PiMessage } from "./transcript.ts";
 import { bashReadOnlyCommand, isAdapterReadOnlyTool, localCommandOf, normalizeCommandName } from "./host-policy.ts";
@@ -80,6 +82,8 @@ export function responseText(response: unknown): string {
 export class HookBridge {
 	readonly pipeline: SwarmHookPipeline;
 	private readonly gateResume = new TaskGateResumeBudget();
+	/** Every user request registered and reconciled before the turn ends (vendored work-registration.ts, HOJA-757). */
+	readonly registration = new WorkRegistrationPolicy();
 	private subagent = false;
 	private startedPostActingSession = "";
 	private readonly pendingToolCallIds = new Map<string, string[]>();
@@ -194,8 +198,14 @@ export class HookBridge {
 			hooks.enforcement.onUserMessage(prompt);
 			hooks.maintenance.onUserMessage(this.tasks(), this.pipeline.budget, session);
 		}
+		// Swarm prefixes pre-tool context onto the tool result AND replays it at the next prompt. Claude Code and Codex
+		// already delivered it as PreToolUse additionalContext, so the replay only repeated a stale nudge ("No active
+		// task is focused" 40 minutes after a task was focused). Antigravity defers it itself (`deferred`).
+		if (this.host !== "antigravity") (this.pipeline as any).pendingToolMessages = [];
 		const { injected } = this.pipeline.onUserPrompt({ messageAfterReceive: this.headless, prompt });
-		return injected ? context("UserPromptSubmit", formatHookContext("user_prompt_submit", injected)) : {};
+		const line = this.registration.onUserPrompt(prompt, this.tasks());
+		const text = [injected, line].filter(Boolean).join("\n");
+		return text ? context("UserPromptSubmit", formatHookContext("user_prompt_submit", text)) : {};
 	}
 
 	private async preTool(payload: HookPayload): Promise<HookOutput> {
@@ -237,6 +247,11 @@ export class HookBridge {
 			await this.shim.emit("tool_result", { toolName, toolCallId, input: params, content: [{ type: "text", text: output }], isError: failed });
 		if (HOST_SCHEMA_LOADERS.has(toolName)) return {};
 		this.pipeline.postTool({ toolName, params, toolCallId, failed, output });
+		// A subagent's calls belong to the subagent's own work; the parent registers the delegation, not each step.
+		if (!this.subagent) this.registration.onToolResult({
+			toolName, params, failed, hostReadOnly: isAdapterReadOnlyTool(toolName, params),
+			taskManageSucceeded: !failed && !/^\s*(?:Error\b|\{"status":"failed")/.test(output),
+		});
 		if (this.host !== "codex") return {};
 		if (toolCallId && this.inFlight.has(toolCallId)) this.inFlight.delete(toolCallId);
 		else this.inFlight.delete(this.inFlight.values().next().value!);
@@ -252,6 +267,7 @@ export class HookBridge {
 	private async stop(payload: HookPayload): Promise<HookOutput> {
 		if (this.subagent || process.env.PI_SWARM_SUBAGENT === "1") return {};
 		await this.shim.emit("turn_end");
+		await this.shim.emit("agent_settle");
 		const session = this.shim.sessionId || "session";
 		const messages: PiMessage[] = [...this.shim.transcript.messages()];
 		const last = messages.at(-1);
@@ -261,12 +277,21 @@ export class HookBridge {
 		const decision = evaluateTaskGateResume({ session, messages, taskFocused: hasFocusedTask(this.tasks()), budget: this.gateResume });
 		// Pi appends the continuation as a hidden custom message; Stop additionalContext continues the turn the same way
 		// (bounded by the vendored budget plus Claude Code's own continuation cap) without flagging a hook error.
-		if (decision.action === "continue" && decision.content)
-			return this.host === "codex" ? { decision: "block", reason: decision.content }
-				: this.host === "antigravity" ? { decision: "continue", reason: decision.content }
-				: context("Stop", decision.content);
+		if (decision.action === "continue" && decision.content) return this.continueTurn(decision.content);
 		if (decision.action === "exhausted" && decision.content) return { systemMessage: decision.content };
-		return {};
+		// Not a gate stop: before the turn ends, the work it did must be registered and its task reconciled. Once per
+		// turn (the policy remembers), so a continuation can never loop.
+		const reminder = this.registration.onSettle(this.tasks());
+		if (!reminder) return {};
+		this.recorder?.record(this.shim.sessionId, "WorkRegistration", { hook: WORK_REGISTRATION_HOOK, reminder });
+		return this.continueTurn(reminder);
+	}
+
+	/** Keep the turn going with `content` as the next instruction, in the host's own Stop wire shape. */
+	private continueTurn(content: string): HookOutput {
+		return this.host === "codex" ? { decision: "block", reason: content }
+			: this.host === "antigravity" ? { decision: "continue", reason: content }
+			: context("Stop", content);
 	}
 
 	private async command(payload: HookPayload): Promise<HookOutput> {

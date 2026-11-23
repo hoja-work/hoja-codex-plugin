@@ -57,10 +57,11 @@ let calls = 0;
 if (hostOf() === "antigravity") listen(socketPath(process.ppid), async (message: Json) => {
 	const event = String(message?.event ?? "");
 	const out = await bridge.handle(event, message?.payload ?? {});
-	// agy has no SessionEnd: flush any touched-issue trace and refresh the saved file after every turn.
+	// agy has no SessionEnd: Stop already scheduled the end-of-reply sync (bridge → agent_settle); once it settles,
+	// refresh the saved trace file so the local copy is current too.
 	if (event === "Stop") setImmediate(() => {
-		runtime.traces.syncSession("turn")
-			.then(lines => (lines.length ? undefined : runtime.traces.run("path")))
+		runtime.traces.idle()
+			.then(() => runtime.traces.run("path"))
 			.catch(error => log(`trace sync failed: ${(error as Error).message}`));
 	});
 	return out;

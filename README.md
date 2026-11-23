@@ -25,8 +25,11 @@ Agents say "done" too easily. Hoja makes "done" mean something:
   evidence is rejected.
 - **Nothing mutates without a task.** A gate blocks shell writes, `apply_patch` and write-capable MCP tools until a
   task is focused. Reads are always free.
-- **Your tracker stays current by itself.** With Hoja mode on, each top-level task becomes a Hoja issue, its
-  progress is rewritten in place, and an evidenced completion moves it to Done.
+- **Your tracker stays current by itself.** With Hoja mode on, each top-level task becomes a Hoja issue and each
+  of its child tasks a sub-issue; progress is rewritten in place, and an evidenced completion moves it to Done.
+- **Nobody has to remind the agent.** Every message you write tells the agent how to register it (a new task, the
+  open one, or a child of the active one), and when a reply ends after real work with its task unreconciled or
+  untracked, the agent is sent back once to complete it with evidence or note what is left.
 
 This is not a re-implementation. The engine, the gate and Hoja mode are
 [Trebol](https://github.com/cloverinternational/trebol)'s own code, vendored byte-for-byte and hash-checked. The
@@ -72,7 +75,7 @@ Then work as usual, and type `hoja:setup` to check everything.
 | **`TaskManage`** | Ordered, durable tasks with dependencies, sub-tasks, notes and 1–12 acceptance questions each. Completion is validated against the workspace and the Codex rollout. |
 | **Task gate** | Trebol's Swarm hook pipeline: blocks non-read-only tools without a focused task (`block`), or only nudges (`advise`). Also: the completion nudge, the task-maintenance nudge, the bare-`sleep` blocker and the stdin-conflict guard. |
 | **Auto-continue** | When a gate block ends the turn, the `Stop` hook sends Codex back with exactly what to do, within the same bounded budget Trebol uses. |
-| **Hoja mode** | `hoja_list`, `hoja_get` and `hoja_project`, plus automatic publication: one Hoja issue per coarse task, acceptance questions in the description, an evidence comment and Done on completion. |
+| **Hoja mode** | `hoja_list`, `hoja_get` and `hoja_project`, plus automatic publication: one Hoja issue per top-level task and one sub-issue per child of it (`hoja:"local"` keeps a step out), acceptance questions in the description, an evidence comment and Done on completion. |
 | **Hosted Hoja API** | The workspace's full MCP API (70+ tools: issues, comments, decisions, projects, cycles) as a second server, `hoja_api`. Its **read** tools are exempt from the gate (see [Deviations from Trebol](#deviations-from-trebol)); its writes are gated and evidence-checked under the same names Trebol uses. |
 | **Session traces** | Every hook event is recorded; with the Codex rollout it becomes a `hoja.trace/v1` trace: turns, one model call per request with exact token usage, every tool call with its duration and outcome (non-zero exits, gate blocks, rejected TaskManage calls), subagents and task updates. Completing a task linked to an issue attaches the trace to that issue, and Hoja opens it in its trace viewer. See [Session traces](#session-traces). |
 | **Prompt commands** | `hoja:tasks`, `hoja:hoja on\|off\|status`, `hoja:trace [upload [ISSUE]\|path]` and `hoja:setup`, typed as the whole prompt. All are answered locally, with no model turn — and `hoja_setup`, the same read-only report as a tool, is the fallback when the prompt hook cannot run. Omit the slash: the Codex TUI rejects unknown `/` commands. |
@@ -130,7 +133,7 @@ trace is needed it is built from those records plus the session's rollout:
 The rollout format is internal to Codex, so it is read defensively. A session whose rollout cannot be read still gets
 a trace from hooks alone.
 
-Uploads use `POST /api/uploads` and `attachmentCreate`, named `codex-<session>-<time>.trace.json` with a
+Uploads go to `POST /api/traces` (older servers: `POST /api/uploads` and `attachmentCreate`) when a linked task completes, in the background at most every 30 s after a tool batch and at the end of every reply once an issue is linked (no hook waits for them), and at session end. Traces are named `codex-<session>-<time>.trace.json` with a
 "Codex trace · …" subtitle, which the Hoja web app opens in its trace viewer. Prompts and outputs are kept whole
 and scrubbed of credential shapes and secret-looking environment values. Trimming (head and tail kept) happens only
 when a trace would pass the 8 MB upload budget. `HOJA_TRACE_DETAIL=metadata` sends timings and counts only. Type

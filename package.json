@@ -1,6 +1,6 @@
 {
   "name": "@hoja/hoja-codex-plugin",
-  "version": "0.5.3",
+  "version": "0.7.0",
   "type": "module",
   "description": "Codex plugin: Trebol's TaskManage, its Swarm task-enforcement hooks and Hoja mode, ported 1:1.",
   "scripts": {

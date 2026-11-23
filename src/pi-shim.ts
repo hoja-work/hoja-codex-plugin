@@ -35,9 +35,20 @@ export class PiShim {
 	cwd: string;
 	/** Messages extensions sent to `ctx.ui.notify`; the hook bridge surfaces them where Claude Code can show them. */
 	notifications: { message: string; level: string }[] = [];
+	/**
+	 * Stable evidence roots for TaskManage: the directory the session started in (and CLAUDE_PROJECT_DIR). `cwd`
+	 * follows every hook payload, i.e. wherever the agent's shell last `cd`-ed, and TaskManage resolves citations
+	 * against it; without these, valid workspace evidence was rejected as outside_allowed_roots after a `cd` (HOJA-757).
+	 * Mutated in place: registerTaskManage keeps this array by reference.
+	 */
+	readonly evidenceRoots: string[] = [];
 	widgets = new Map<string, unknown>();
 
-	constructor(private readonly options: ShimOptions) { this.cwd = options.cwd; }
+	constructor(private readonly options: ShimOptions) {
+		this.cwd = options.cwd;
+		const project = process.env.CLAUDE_PROJECT_DIR?.trim();
+		if (project) this.evidenceRoots.push(project);
+	}
 
 	/** The object handed to `registerTaskManage(pi, …)` and `registerHojaMode(pi, …)`. */
 	readonly api = {
@@ -122,6 +133,8 @@ export class PiShim {
 		if (sessionId === this.sessionId) return false;
 		if (this.sessionId) await this.emit("session_shutdown");
 		this.sessionId = sessionId;
+		// The first cwd a session binds with is where it started; it stays citable for the whole session.
+		if (cwd && !this.evidenceRoots.includes(cwd)) this.evidenceRoots.push(cwd);
 		this.entries = [];
 		const path = this.journalPath(sessionId);
 		if (existsSync(path)) {
