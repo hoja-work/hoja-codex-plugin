@@ -16,11 +16,13 @@
  */
 import type { Task } from "../vendor/trebol/packages/tools/taskmanage/src/task-manage.ts";
 
-/** The marker lines `publish.ts` writes; both name the TaskManage task the issue belongs to. */
+/** The marker `publish.ts` writes names the TaskManage task the issue belongs to: today a hidden
+ *  `<!-- hoja-task:<session>:<task> -->` line, earlier a visible `Link marker:` line next to "Tracked by TaskManage
+ *  task #N". Only a whole marker line counts, so prose that quotes a marker never picks a task. */
 const TRACKED_BY = /Tracked by TaskManage task #([^\s]+) in session/;
-const LINK_MARKER = /Link marker: hoja-task:[^:\s]+:([A-Za-z0-9_-]+)/;
+const LINK_MARKER = /^\s*(?:<!-- |Link marker: )hoja-task:[^:\s]+:([A-Za-z0-9_-]+)(?: -->)?\s*$/m;
 export const taskIdOfDescription = (description: string): string | undefined =>
-	TRACKED_BY.exec(description)?.[1] ?? LINK_MARKER.exec(description)?.[1];
+	LINK_MARKER.exec(description)?.[1] ?? TRACKED_BY.exec(description)?.[1];
 
 /** Hoja/Linear priorities are integers: 0 none, 1 urgent, 2 high, 3 medium, 4 low. TaskManage has no "urgent". */
 export const PRIORITY_VALUES: Readonly<Record<string, number>> = { urgent: 1, high: 2, medium: 3, low: 4 };

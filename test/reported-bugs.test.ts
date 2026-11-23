@@ -164,7 +164,9 @@ describe("item 3: publication carries the task's description and priority", () =
 		const fake = await publish("high", "The long description of the task body.", new FakeHoja());
 		expect(fake.created.length).toBe(1);
 		expect(fake.created[0].description).toContain("The long description of the task body.");
-		expect(fake.created[0].description).toContain("Tracked by TaskManage task #1");
+		expect(fake.created[0].description).toMatch(/^<!-- hoja-task:[^:\s]+:1 -->$/m);
+		expect(fake.created[0].description).toContain("- [ ] done?");
+		for (const noise of ["Tracked by", "Link marker", "Status:", "`q1`"]) expect(fake.created[0].description).not.toContain(noise);
 		const priority = fake.mutations.filter(m => m.variables?.input?.priority !== undefined);
 		expect(priority.map(m => m.variables.input.priority)).toEqual([2]);
 		expect(priority[0].variables.id).toBe("issue-1");
@@ -187,6 +189,8 @@ describe("item 3: publication carries the task's description and priority", () =
 		expect(priorityValue(undefined)).toBeUndefined();
 		expect(taskIdOfDescription("Tracked by TaskManage task #7 in session abc")).toBe("7");
 		expect(taskIdOfDescription("Link marker: hoja-task:sess-1:12")).toBe("12");
+		expect(taskIdOfDescription("Body.\n\n<!-- hoja-task:sess-1:12 -->\n\n<!-- hoja-managed:start -->")).toBe("12");
+		expect(taskIdOfDescription("see hoja-task:sess-1:12 in prose")).toBeUndefined();
 	});
 });
 

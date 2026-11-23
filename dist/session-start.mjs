@@ -1996,14 +1996,10 @@ function acceptedCompletion(facts) {
   return facts.status === "completed" && facts.questions.every((question) => !!question.answer);
 }
 function managedSection(facts) {
-  const lines = [MANAGED_START, `Status: ${facts.status}`];
+  const lines = [MANAGED_START];
   if (facts.questions.length) {
-    lines.push("", "Acceptance questions (tracked here, not as separate issues):");
-    for (const question of facts.questions) {
-      lines.push(`- [${question.answer ? "x" : " "}] \`${question.id}\` ${question.text}`);
-      if (question.answer) lines.push(`  - Answer: ${question.answer}`);
-      if (question.evidence) lines.push(`  - Evidence: ${question.evidence}`);
-    }
+    lines.push("**Acceptance criteria**", "");
+    for (const question of facts.questions) lines.push(`- [${question.answer ? "x" : " "}] ${oneLine(question.text) || question.id}`);
   }
   lines.push(MANAGED_END);
   return lines.join("\n");
@@ -2018,9 +2014,11 @@ function mergeManagedDescription(existing, section) {
 }
 function hasMarkerLine(text3, label, marker) {
   if (!marker) return false;
-  const wanted = `${label}: ${marker}`;
-  return String(text3 ?? "").split(/\r?\n/).some((line) => line.trim() === wanted);
+  const wanted = /* @__PURE__ */ new Set([hiddenMarker(marker), `${label}: ${marker}`]);
+  return String(text3 ?? "").split(/\r?\n/).some((line) => wanted.has(line.trim()));
 }
+var hiddenMarker = (marker) => `<!-- ${marker} -->`;
+var oneLine = (value) => value.replace(/\s*\r?\n\s*/g, " ").trim();
 var hasLinkMarker = (description, marker) => hasMarkerLine(description, "Link marker", marker);
 var hasAnswerMarker = (comment, marker) => hasMarkerLine(comment, "Answer marker", marker);
 function answerRevision(facts) {
@@ -2037,21 +2035,29 @@ function answerMarker(sessionKey, taskId, revision) {
   const task = String(taskId ?? "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "task";
   return `hoja-answer:${session}:${task}:${revision}`;
 }
+function evidenceText(evidence) {
+  const refs = evidence.split(";").map((ref) => oneLine(ref)).filter(Boolean);
+  return refs.map((ref) => ref.includes("`") ? ref : `\`${ref}\``).join(", ");
+}
 function completionComment(facts, marker) {
-  const lines = [`TaskManage task #${facts.taskId} completed: ${facts.subject}`, "", `Answer marker: ${marker}`];
-  if (!facts.questions.length) lines.push("", "This task recorded no acceptance questions.");
-  else {
-    lines.push("", "Answers:");
+  const lines = [`**Completed:** ${oneLine(facts.subject)}`];
+  if (facts.questions.length) {
+    lines.push("");
     for (const question of facts.questions) {
-      lines.push(`- \`${question.id}\` ${question.text}`, `  - Answer: ${question.answer ?? "(unanswered)"}`);
-      if (question.evidence) lines.push(`  - Evidence: ${question.evidence}`);
+      lines.push(`- **${oneLine(question.text) || question.id}**`, "");
+      const answer = (question.answer ?? "(unanswered)").trim().split(/\r?\n/).map((line) => line.trimEnd());
+      for (const line of answer) lines.push(line ? `  ${line}` : "");
+      if (question.evidence) lines.push("", `  Evidence: ${evidenceText(question.evidence)}`);
+      lines.push("");
     }
   }
+  if (lines[lines.length - 1] !== "") lines.push("");
+  lines.push(hiddenMarker(marker));
   return lines.join("\n");
 }
 var stateFor = (facts) => facts.status === "in_progress" ? "In Progress" : "Todo";
 function subissueDescription(facts, marker) {
-  return [facts.description, `Link marker: ${marker}`, managedSection(facts)].filter(Boolean).join("\n\n");
+  return [facts.description, hiddenMarker(marker), managedSection(facts)].filter(Boolean).join("\n\n");
 }
 async function syncTask(args) {
   const { writer, facts, active, journal, at } = args;
@@ -2395,12 +2401,7 @@ function taskMarker(sessionKey, taskId) {
 }
 function issueDescription(input2) {
   const body = (input2.description ?? "").trim();
-  return [
-    body,
-    `Tracked by TaskManage task #${input2.taskId} in session ${input2.sessionKey.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 8)}.`,
-    `Link marker: ${input2.marker}`,
-    input2.managed ?? ""
-  ].filter(Boolean).join("\n\n");
+  return [body, hiddenMarker(input2.marker), input2.managed ?? ""].filter(Boolean).join("\n\n");
 }
 function replayHojaRecords(entries) {
   const records = {};
@@ -5876,8 +5877,8 @@ if (process.argv[1] && /api-proxy\.(m?js|ts)$/.test(process.argv[1])) main();
 
 // src/hoja-writer.ts
 var TRACKED_BY = /Tracked by TaskManage task #([^\s]+) in session/;
-var LINK_MARKER = /Link marker: hoja-task:[^:\s]+:([A-Za-z0-9_-]+)/;
-var taskIdOfDescription = (description) => TRACKED_BY.exec(description)?.[1] ?? LINK_MARKER.exec(description)?.[1];
+var LINK_MARKER = /^\s*(?:<!-- |Link marker: )hoja-task:[^:\s]+:([A-Za-z0-9_-]+)(?: -->)?\s*$/m;
+var taskIdOfDescription = (description) => LINK_MARKER.exec(description)?.[1] ?? TRACKED_BY.exec(description)?.[1];
 var PRIORITY_VALUES = { urgent: 1, high: 2, medium: 3, low: 4 };
 var priorityValue = (priority) => typeof priority === "string" ? PRIORITY_VALUES[priority.trim().toLowerCase()] : void 0;
 var withTaskDescription = (description, taskDescription) => {
