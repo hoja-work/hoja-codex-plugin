@@ -10,7 +10,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRuntime } from "../src/runtime.ts";
-import { priorityValue, taskIdOfDescription, withTaskDescription } from "../src/hoja-writer.ts";
+import { priorityValue } from "../vendor/trebol/extensions/hoja-mode/publish.ts";
 import { normalizeCommandName, stripFdRedirections, isAdapterReadOnlyTool } from "../src/host-policy.ts";
 
 const OWN = "mcp__plugin_hoja_hoja__";
@@ -34,12 +34,10 @@ class FakeHoja {
 	created: { title: string; description: string; state: string; options: any }[] = [];
 	mutations: { query: string; variables: any }[] = [];
 	description = "";
-	failPriority = false;
 	states: string[] = [];
 	comments: string[] = [];
 	async gql(query: string, variables?: any) {
 		this.mutations.push({ query, variables });
-		if (this.failPriority) throw new Error("priority write refused");
 		return { issueUpdate: { success: true } };
 	}
 	async resolve(project: string) {
@@ -160,33 +158,27 @@ describe("item 3: publication carries the task's description and priority", () =
 		return fake;
 	}
 
-	it("puts the task description in the issue body and writes its priority", async () => {
+	it("creates a clean Markdown issue carrying the task's description and priority", async () => {
 		const fake = await publish("high", "The long description of the task body.", new FakeHoja());
 		expect(fake.created.length).toBe(1);
-		expect(fake.created[0].description).toContain("The long description of the task body.");
-		expect(fake.created[0].description).toContain("Tracked by TaskManage task #1");
-		const priority = fake.mutations.filter(m => m.variables?.input?.priority !== undefined);
-		expect(priority.map(m => m.variables.input.priority)).toEqual([2]);
-		expect(priority[0].variables.id).toBe("issue-1");
+		// Exactly the task's Markdown and its checklist: no marker, tracking line, status, ids or HTML comment.
+		expect(fake.created[0].description).toBe("The long description of the task body.\n\n## Acceptance criteria\n\n- [ ] done?");
+		// Priority travels with the create itself; there is no second write that could be lost.
+		expect(fake.created[0].options).toMatchObject({ priority: 2 });
+		expect(fake.mutations.filter(m => m.variables?.input?.priority !== undefined)).toEqual([]);
 	});
 
-	it("still publishes the default priority medium and never fails the issue when that write is refused", async () => {
-		const fake = new FakeHoja();
-		fake.failPriority = true;
-		await publish("medium", "body", fake);
-		expect(fake.created.length).toBe(1);
-		expect(fake.mutations.some(m => m.variables?.input?.priority === 3)).toBe(true);
-		// The issue exists and is linked; only the priority write was lost.
+	it("sends the default priority medium with the create", async () => {
+		const fake = await publish("medium", "body", new FakeHoja());
+		expect(fake.created[0].options).toMatchObject({ priority: 3 });
 		expect(fake.created[0].title).toBe("Fix the thing");
 	});
 
-	it("prepends a description Trebol's composed body did not carry, and maps priorities", () => {
-		expect(withTaskDescription("Tracked by TaskManage task #1", "the task body")).toBe("the task body\n\nTracked by TaskManage task #1");
-		expect(withTaskDescription("the task body\n\nLink marker: x", "the task body")).toBe("the task body\n\nLink marker: x");
+	it("maps TaskManage priorities to Hoja's integers", () => {
 		expect(priorityValue("low")).toBe(4);
+		expect(priorityValue("High")).toBe(2);
 		expect(priorityValue(undefined)).toBeUndefined();
-		expect(taskIdOfDescription("Tracked by TaskManage task #7 in session abc")).toBe("7");
-		expect(taskIdOfDescription("Link marker: hoja-task:sess-1:12")).toBe("12");
+		expect(priorityValue("someday")).toBeUndefined();
 	});
 });
 
