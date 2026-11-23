@@ -442,8 +442,9 @@ describe("task-independent trace capture & correlation (HOJA-743)", () => {
 		});
 		expect(readTouchedIssues(dataDir, "s-no-task")).toEqual(["HOJA-42"]);
 
-		// Stop triggers turn_end -> syncSession("turn") without any TaskManage task
+		// Stop schedules the end-of-reply sync in the background, without any TaskManage task
 		await hook("Stop", { last_assistant_message: "Done." });
+		await rt.traces.idle();
 		const traceCalls = hoja.calls.filter(c => c.url.endsWith("/api/traces"));
 		expect(traceCalls).toHaveLength(1);
 		const posted = JSON.parse(traceCalls[0].init.body);
@@ -467,6 +468,7 @@ describe("task-independent trace capture & correlation (HOJA-743)", () => {
 		await hook("UserPromptSubmit", { prompt: "top secret prompt text" });
 		await hook("PostToolUse", { tool_name: "mcp__hoja__hoja_commentCreate", tool_input: JSON.stringify({ issueId: "HOJA-5" }), tool_use_id: "hc2" });
 		await hook("Stop", { last_assistant_message: "ok" });
+		await rt.traces.idle();
 		await sessionEnd({ session_id: "s-meta", transcript_path: transcriptPath, cwd: dir, reason: "other" }, { ...env, HOJA_PLUGIN_DATA: dataDir, HOJA_PLUGIN_TRACE_UPLOAD: "off" }, hoja.fetchImpl);
 		expect(hoja.calls).toHaveLength(0);
 		const collected = collectTrace({ dataDir, sessionId: "s-meta", env });

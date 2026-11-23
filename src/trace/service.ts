@@ -26,8 +26,20 @@ export interface TraceServiceOptions {
 
 const ISSUE = /^[A-Za-z0-9]+-\d+$/;
 
+/** Minimum gap between two mid-reply ("turn") syncs; the end of every reply always syncs. HOJA_TRACE_SYNC_INTERVAL_MS. */
+export const TURN_SYNC_INTERVAL_MS = 30_000;
+const MAX_BACKOFF_MS = 10 * 60_000;
+const MAX_COMPLETION_ATTEMPTS = 3;
+
 export class TraceService {
 	private syncing = false;
+	/** After a failed sync, mid-reply syncs pause (30 s, doubling, capped at 10 min); end-of-reply and session-end still try. */
+	private failures = 0;
+	private retryAt = 0;
+	/** Background sync scheduling (`schedule`): one in flight, at most one queued, throttled mid-reply. */
+	private inFlight?: Promise<void>;
+	private queued?: "turn" | "reply";
+	private lastTurnSync = 0;
 	constructor(private readonly options: TraceServiceOptions) {}
 
 	private get env() { return this.options.env ?? process.env; }
@@ -61,7 +73,16 @@ export class TraceService {
 		const s = this.options.session();
 		if (!s.id) return [];
 		const links = hojaLinks(s.entries);
-		const done = new Set(readLedger(this.options.dataDir, s.id).filter(e => e.reason === "completion").map(e => `${e.taskId}:${e.issue}`));
+		// A failed completion upload is recorded with an empty url. It is retried on later TaskManage calls (and at session
+		// end) until it succeeds or has failed MAX_COMPLETION_ATTEMPTS times, so one network blip no longer loses it.
+		const attempts = new Map<string, number>();
+		const done = new Set<string>();
+		for (const e of readLedger(this.options.dataDir, s.id)) {
+			if (e.reason !== "completion") continue;
+			const key = `${e.taskId}:${e.issue}`;
+			if (e.url) done.add(key);
+			else if ((attempts.set(key, (attempts.get(key) ?? 0) + 1).get(key) ?? 0) >= MAX_COMPLETION_ATTEMPTS) done.add(key);
+		}
 		return s.tasks.filter(t => t?.status === "completed" && links.has(String(t.id)))
 			.map(t => ({ taskId: String(t.id), issue: links.get(String(t.id))! }))
 			.filter(p => !done.has(`${p.taskId}:${p.issue}`));
@@ -96,9 +117,10 @@ export class TraceService {
 	 * Task-independent trace sync (turn settle / session end): if any Hoja issue was touched in this session and
 	 * the trace gained spans or new issues since the last upload, upsert the trace idempotently via `/api/traces`.
 	 */
-	async syncSession(reason: "turn" | "session-end"): Promise<string[]> {
+	async syncSession(reason: "turn" | "reply" | "session-end"): Promise<string[]> {
 		if (this.options.upload === "off" || this.options.upload === "manual") return [];
 		if (this.syncing || this.uploadProblem()) return [];
+		if (reason === "turn" && Date.now() < this.retryAt) return [];
 		const trace = this.build();
 		if (!trace || !trace.issues.length) return [];
 		const prev = readFlushState(this.options.dataDir, trace.session.id);
@@ -111,7 +133,8 @@ export class TraceService {
 			const target = { graphqlUrl: resolveHojaUrl(this.env), token: resolveHojaToken(this.env), fetchImpl: this.options.fetchImpl };
 			const out: string[] = [];
 			try {
-				const res = await uploadSessionTrace(trace, trace.issues, target, reason);
+				const res = await uploadSessionTrace(trace, trace.issues, target, reason === "reply" ? "turn" : reason);
+				this.failures = 0; this.retryAt = 0;
 				for (const att of res.attachments) {
 					appendLedger(this.options.dataDir, trace.session.id, {
 						issue: att.issue, at: new Date().toISOString(), url: att.url,
@@ -125,7 +148,9 @@ export class TraceService {
 				return out;
 			} catch (error) {
 				if (!(error instanceof LegacyTraceEndpointError)) {
-					this.options.log?.(`session trace sync failed (${reason}): ${(error as Error).message}`);
+					this.failures++;
+					this.retryAt = Date.now() + Math.min(MAX_BACKOFF_MS, 30_000 * 2 ** (this.failures - 1));
+					this.options.log?.(`session trace sync failed (${reason}, attempt ${this.failures}): ${(error as Error).message}`);
 					return [];
 				}
 				// Older Hoja server without /api/traces: fall back to once-per-issue attachmentCreate.
@@ -148,6 +173,33 @@ export class TraceService {
 		} finally {
 			this.syncing = false;
 		}
+	}
+
+	/**
+	 * Sync in the background, off the hook's critical path (HOJA-757: an awaited sync on every PostToolBatch made the
+	 * hook 7–15x slower and grew with the trace). "turn" (a tool batch settled) is throttled to one per
+	 * TURN_SYNC_INTERVAL_MS; "reply" (the agent ended its reply) always runs, so the issue sees each reply's final
+	 * state. One sync runs at a time; requests that arrive meanwhile collapse into one follow-up.
+	 */
+	schedule(kind: "turn" | "reply"): void {
+		if (this.options.upload === "off" || this.options.upload === "manual") return;
+		const interval = Number(this.env.HOJA_TRACE_SYNC_INTERVAL_MS ?? TURN_SYNC_INTERVAL_MS);
+		if (kind === "turn" && Date.now() - this.lastTurnSync < (Number.isFinite(interval) ? interval : TURN_SYNC_INTERVAL_MS)) return;
+		if (this.inFlight) { if (kind === "reply" || !this.queued) this.queued = kind; return; }
+		this.lastTurnSync = Date.now();
+		this.inFlight = this.syncSession(kind)
+			.then(() => undefined, error => this.options.log?.(`trace sync failed: ${(error as Error).message}`))
+			.finally(() => {
+				this.inFlight = undefined;
+				const next = this.queued;
+				this.queued = undefined;
+				if (next) { this.lastTurnSync = 0; this.schedule(next); }
+			});
+	}
+
+	/** Resolves once no background sync is running or queued (tests, SessionEnd). */
+	async idle(): Promise<void> {
+		while (this.inFlight) await this.inFlight;
 	}
 
 	contentNotice(): string {

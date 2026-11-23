@@ -1,6 +1,6 @@
 ---
 name: hoja
-description: Use the Hoja plugin's TaskManage workflow — plan work as tasks with acceptance questions, focus one before acting, and complete it only with real evidence. Also covers the hoja:tasks, hoja:hoja, hoja:trace and hoja:setup prompt commands.
+description: Use the Hoja plugin's TaskManage workflow — register every user request as a task (deliverables as sub-issues), plan work as tasks with acceptance questions, focus one before acting, and complete it only with real evidence. Also covers the hoja:tasks, hoja:hoja, hoja:trace and hoja:setup prompt commands.
 ---
 
 # Hoja task workflow
@@ -18,7 +18,22 @@ are blocked until a TaskManage task is focused. Read-only tools are always allow
      (shell commands count as `Bash`).
    A rejected completion lists exactly what is missing — fix that input; never repeat it unchanged.
 
-With Hoja mode on, each top-level task is published as one Hoja issue, kept current on every update, and moved to
+## Register work without being asked
+
+The user should never have to remind you to track work or update a task.
+
+- **Every request that changes files or state gets a task before you act**, not only long work. Short follow-ups
+  ("commit everything", "update both READMEs", "merge and deploy") are requests too.
+- **One request, several deliverables:** one root task plus one child per deliverable (`parentTaskId`, in the same
+  batch). With Hoja mode on, the root becomes one issue and each child becomes its sub-issue.
+- **A new message outside the active task:** create a new root task for it (or a child, if it serves the same
+  goal). Never fold a new request into an unrelated task.
+- **`metadata: {"hoja":"local"}`** is for mechanical steps under a parent (run the tests, push). Never put it on a
+  user request: that request then never reaches Hoja.
+- **Before you end a reply:** complete each finished task with evidence, or `addNote` what is left. If you forget,
+  the plugin continues your turn once with a reminder.
+
+With Hoja mode on, each top-level task is published as one Hoja issue (and each child of it as a sub-issue), kept current on every update, and moved to
 Done with an evidence comment when it is completed. That completion also attaches this session's trace (turns, model
 calls with tokens, every tool call and gate block) to the issue; the TaskManage result says so. The `hoja_trace`
 tool's `summary` only reads; `upload` is a write and needs a focused task.

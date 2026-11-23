@@ -15,7 +15,7 @@ import { Redactor } from "./redact.ts";
 import { readTouchedIssues } from "./touched.ts";
 import type { HojaTrace, TraceTask } from "./schema.ts";
 
-export const PLUGIN_VERSION = "0.5.3";
+export const PLUGIN_VERSION = "0.7.0";
 const HOJA_TASK_ENTRY = "hoja-task-link";
 const TASK_STATE_ENTRY = "pi-swarm-task-state";
 

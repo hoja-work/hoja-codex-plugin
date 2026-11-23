@@ -46,7 +46,7 @@ export interface Runtime { shim: PiShim; manager: TaskManager; bridge: HookBridg
 
 export function createRuntime(options: RuntimeOptions): Runtime {
 	const shim = new PiShim(options);
-	const manager = registerTaskManage(shim.api as any, taskManageRenderers, { workspaceRoot: options.cwd, toolAliases });
+	const manager = registerTaskManage(shim.api as any, taskManageRenderers, { workspaceRoot: options.cwd, toolAliases, evidenceRoots: shim.evidenceRoots });
 	// extensions/taskmanage/extension.ts: Swarm's builtin hooks read task state through this handle.
 	(globalThis as any)[TASK_MANAGER_SYMBOL] = manager;
 	const tracing = options.trace?.enabled !== false;
@@ -78,10 +78,10 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 		const lines = await traces.afterTaskManage();
 		return lines.length ? { content: [...(event.content ?? []), { type: "text", text: lines.join("\n") }] } : undefined;
 	});
-	// Task-independent trace sync: flush idempotently at turn settle when any Hoja issue was touched.
-	shim.api.on("turn_end", async () => {
-		await traces.syncSession("turn");
-	});
+	// Task-independent trace sync when any Hoja issue was touched: in the background, never awaited by a hook.
+	// A settled tool batch syncs at most every 30 s; the end of a reply ("agent_settle", from Stop) always syncs.
+	shim.api.on("turn_end", () => { traces.schedule("turn"); });
+	shim.api.on("agent_settle", () => { traces.schedule("reply"); });
 	shim.api.registerCommand("trace", {
 		description: "Session trace: summary (default), upload [ISSUE], path",
 		handler: (args: string) => traces.run(args),
