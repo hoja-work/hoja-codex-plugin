@@ -25,6 +25,7 @@ export interface BuildInput {
 	subagents?: SubagentTranscript[];
 	hooks: HookRecord[];
 	tasks?: TraceTask[];
+	extraIssues?: string[];
 	plugin: string;
 	host?: string;
 	detail?: "full" | "metadata";
@@ -616,7 +617,7 @@ export function buildTrace(input: BuildInput): HojaTrace {
 		},
 		tools: [...tools.values()].sort((x, y) => y.calls - x.calls || y.totalMs - x.totalMs),
 		tasks: input.tasks ?? [],
-		issues: [...new Set((input.tasks ?? []).map(t => t.issue).filter((i): i is string => !!i))],
+		issues: [...new Set([...(input.tasks ?? []).map(t => t.issue).filter((i): i is string => !!i), ...(input.extraIssues ?? []).filter(Boolean)])],
 		spans,
 		events: b.events,
 		...(b.truncated.length ? { truncated: b.truncated } : {}),

@@ -113,12 +113,24 @@ type FetchLike = (url: string, init: any) => Promise<any>;
  * A fetch that always sends the current token, and on a 401 refreshes a CLI sign-in once and retries.
  * Used for both the GraphQL client and the MCP proxy, so neither holds a token that silently goes stale.
  */
-export function authFetch(credentials: Credentials, base: FetchLike = fetch as any): FetchLike {
+export function authFetch(
+	credentials: Credentials,
+	base: FetchLike = fetch as any,
+	extraHeaders?: () => Record<string, string | undefined>,
+): FetchLike {
 	const withToken = (init: any) => {
 		const headers = { ...(init?.headers ?? {}) } as Record<string, string>;
-		for (const key of Object.keys(headers)) if (key.toLowerCase() === "authorization") delete headers[key];
 		const token = credentials.token();
-		if (token) headers.authorization = `Bearer ${token}`;
+		if (token) {
+			for (const key of Object.keys(headers)) if (key.toLowerCase() === "authorization") delete headers[key];
+			headers.authorization = `Bearer ${token}`;
+		}
+		if (!Object.keys(headers).some(k => k.toLowerCase() === "x-hoja-actor")) headers["x-hoja-actor"] = "agent";
+		if (extraHeaders) {
+			for (const [k, v] of Object.entries(extraHeaders())) {
+				if (v && !Object.keys(headers).some(existing => existing.toLowerCase() === k.toLowerCase())) headers[k] = v;
+			}
+		}
 		return { ...init, headers };
 	};
 	return async (url, init) => {

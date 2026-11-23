@@ -57,8 +57,12 @@ let calls = 0;
 if (hostOf() === "antigravity") listen(socketPath(process.ppid), async (message: Json) => {
 	const event = String(message?.event ?? "");
 	const out = await bridge.handle(event, message?.payload ?? {});
-	// agy has no SessionEnd: the saved trace is refreshed after every turn, once the hook has its answer.
-	if (event === "Stop") setImmediate(() => { runtime.traces.run("path").catch(error => log(`trace save failed: ${(error as Error).message}`)); });
+	// agy has no SessionEnd: flush any touched-issue trace and refresh the saved file after every turn.
+	if (event === "Stop") setImmediate(() => {
+		runtime.traces.syncSession("turn")
+			.then(lines => (lines.length ? undefined : runtime.traces.run("path")))
+			.catch(error => log(`trace sync failed: ${(error as Error).message}`));
+	});
 	return out;
 }, log);
 

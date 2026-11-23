@@ -13,7 +13,8 @@ import { collectTrace, readSubagents } from "../src/trace/collect.ts";
 import { readHookRecords, TraceRecorder } from "../src/trace/recorder.ts";
 import { clip, clipMiddle, Redactor } from "../src/trace/redact.ts";
 import { renderSummary } from "../src/trace/render.ts";
-import { readLedger, uploadTrace, traceSubtitle, type FetchLike } from "../src/trace/upload.ts";
+import { readLedger, uploadSessionTrace, uploadTrace, traceSubtitle, type FetchLike } from "../src/trace/upload.ts";
+import { extractTouchedIssuesFromTool, readActiveSession, readTouchedIssues, recordActiveSession } from "../src/trace/touched.ts";
 import { createRuntime } from "../src/runtime.ts";
 import { sessionEnd } from "../src/trace-hook.ts";
 import { TRACE_SCHEMA, totalTokens } from "../src/trace/schema.ts";
@@ -258,10 +259,33 @@ describe("recorder", () => {
 });
 
 // Records what a Hoja server would receive.
-function fakeHoja(options: { failUpload?: number } = {}) {
+function fakeHoja(options: { failUpload?: number; tracesEndpoint?: boolean } = {}) {
 	const calls: { url: string; init: any }[] = [];
 	const fetchImpl: FetchLike = async (url, init) => {
 		calls.push({ url, init });
+		if (url.endsWith("/api/traces")) {
+			if (!options.tracesEndpoint) return { status: 404, text: async () => "{}" };
+			if (options.failUpload) return { status: options.failUpload, text: async () => "{}" };
+			const body = JSON.parse(init.body);
+			const issues: string[] = (Array.isArray(body.issues) ? body.issues : []).filter((i: string) => i !== "NOPE-1");
+			return {
+				status: 200,
+				text: async () => JSON.stringify({
+					url: issues.length ? "/api/uploads/trace-1.json" : "",
+					title: "claude-code-trace.trace.json",
+					subtitle: "Claude Code trace",
+					issues,
+					attachments: issues.map((issue: string, i: number) => ({
+						id: `att-tr-${i + 1}`,
+						issue,
+						url: "/api/uploads/trace-1.json",
+						title: "claude-code-trace.trace.json",
+						subtitle: "Claude Code trace",
+						updated: false,
+					})),
+				}),
+			};
+		}
 		if (url.endsWith("/api/uploads")) {
 			if (options.failUpload) return { status: options.failUpload, text: async () => "{}" };
 			return { status: 200, text: async () => JSON.stringify({ url: "/api/uploads/abc123.json", title: "t", contentType: "application/json" }) };
@@ -277,13 +301,13 @@ describe("upload", () => {
 		const trace = buildTrace({ sessionId: "abcdef1234", plugin: "p", redactor: new Redactor({}), hooks: [{ at: "2026-11-23T10:00:00.000Z", event: "UserPromptSubmit", prompt: "x" }] });
 		const hoja = fakeHoja();
 		const result = await uploadTrace(trace, "HOJA-1", { graphqlUrl: "https://h.example/graphql", token: "tok", fetchImpl: hoja.fetchImpl });
-		expect(hoja.calls[0].url).toBe("https://h.example/api/uploads");
-		expect(hoja.calls[0].init.headers.authorization).toBe("Bearer tok");
-		const file = hoja.calls[0].init.body.get("file") as File;
+		expect(hoja.calls.map(c => c.url)).toEqual(["https://h.example/api/traces", "https://h.example/api/uploads", "https://h.example/graphql"]);
+		expect(hoja.calls[1].init.headers.authorization).toBe("Bearer tok");
+		const file = hoja.calls[1].init.body.get("file") as File;
 		expect(file.name).toMatch(/^claude-code-abcdef12-.*\.trace\.json$/);
 		expect(JSON.parse(await file.text()).schema).toBe(TRACE_SCHEMA);
-		const attach = JSON.parse(hoja.calls[1].init.body);
-		expect(hoja.calls[1].url).toBe("https://h.example/graphql");
+		const attach = JSON.parse(hoja.calls[2].init.body);
+		expect(hoja.calls[2].url).toBe("https://h.example/graphql");
 		expect(attach.variables.input).toMatchObject({ issueId: "HOJA-1", url: "/api/uploads/abc123.json", subtitle: traceSubtitle(trace) });
 		expect(attach.variables.input.title).toMatch(/\.trace\.json$/);
 		expect(result.attachmentId).toBe("att-1");
@@ -368,5 +392,85 @@ describe("runtime: a completed, linked task gets its trace attached", () => {
 		const saved = collectTrace({ dataDir: join(f.dir, "data"), sessionId: "s-1", env: {} });
 		expect(saved.events.map(e => e.message)).toContain("Session ended (prompt_input_exit)");
 		expect(saved.spans.some(s => s.id === "tool:tu_bash")).toBe(true);
+	});
+});
+
+describe("task-independent trace capture & correlation (HOJA-743)", () => {
+	it("extracts touched issues from Hoja write tools only, never read-only tools", () => {
+		expect(extractTouchedIssuesFromTool("mcp__hoja__hoja_commentCreate", { issueId: "HOJA-42", body: "done" }, '{"identifier":"HOJA-42"}')).toEqual(["HOJA-42"]);
+		expect(extractTouchedIssuesFromTool("mcp__hoja__hoja_commentCreate", { issueId: "uuid-1", body: "done" }, '{"commentCreate":{"comment":{"id":"c1","url":"https://h.example/e2e/issue/ENG-1#comment-c1"}}}')).toEqual(["ENG-1"]);
+		expect(extractTouchedIssuesFromTool("mcp__plugin_hoja_hoja-api__hoja_issueCreate", { title: "Bug" }, '{"issueCreate":{"success":true,"issue":{"identifier":"HOJA-88"}}}')).toEqual(["HOJA-88"]);
+		expect(extractTouchedIssuesFromTool("mcp__hoja__hoja_issue", { id: "HOJA-99" }, '{"identifier":"HOJA-99"}')).toEqual([]);
+		expect(extractTouchedIssuesFromTool("Bash", { command: "echo HOJA-99" }, "HOJA-99")).toEqual([]);
+	});
+
+	it("records and resolves active session by parent pid", () => {
+		const dataDir = mkdtempSync(join(tmpdir(), "hoja-act-"));
+		recordActiveSession(dataDir, "sess-pid-1", 424242);
+		recordActiveSession(dataDir, "sess-pid-2", 434343);
+		expect(readActiveSession(dataDir, 424242)).toBe("sess-pid-1");
+		expect(readActiveSession(dataDir, 434343)).toBe("sess-pid-2");
+		expect(readActiveSession(dataDir, 999999)).toBe("sess-pid-2");
+	});
+
+	it("uploads directly to POST /api/traces with agent headers", async () => {
+		const trace = buildTrace({ sessionId: "sess-tr-1", plugin: "p", redactor: new Redactor({}), hooks: [{ at: "2026-11-23T10:00:00.000Z", event: "UserPromptSubmit", prompt: "x" }] });
+		const hoja = fakeHoja({ tracesEndpoint: true });
+		const res = await uploadSessionTrace(trace, ["HOJA-15"], { graphqlUrl: "https://h.example/graphql", token: "tok", fetchImpl: hoja.fetchImpl }, "turn");
+		expect(hoja.calls).toHaveLength(1);
+		expect(hoja.calls[0].url).toBe("https://h.example/api/traces");
+		expect(hoja.calls[0].init.headers).toMatchObject({ authorization: "Bearer tok", "x-hoja-actor": "agent", "x-hoja-session-id": "sess-tr-1" });
+		expect(res.issues).toEqual(["HOJA-15"]);
+	});
+
+	it("auto-uploads on Stop and is idempotent across SessionEnd without any TaskManage tasks", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "hoja-notask-"));
+		const { transcriptPath } = session(dir);
+		const hoja = fakeHoja({ tracesEndpoint: true });
+		const env = { HOJA_API_URL: "https://h.example/graphql", HOJA_TOKEN: "ghp_secretTokenValue1234567890", HOJA_PLUGIN_TRACE_DETAIL: "full" };
+		const dataDir = join(dir, "data");
+		const rt = createRuntime({ dataDir, cwd: dir, hoja: false, enforcementMode: "block", trace: { upload: "completion", fetchImpl: hoja.fetchImpl, env } });
+		const hook = (event: string, extra: Record<string, unknown> = {}) => rt.bridge.handle(event, { session_id: "s-no-task", transcript_path: transcriptPath, cwd: dir, agent_id: "", event, ...extra });
+
+		await hook("SessionStart");
+		await hook("UserPromptSubmit", { prompt: "comment on HOJA-42 with token ghp_secretTokenValue1234567890" });
+		await hook("PostToolUse", {
+			tool_name: "mcp__plugin_hoja_hoja-api__hoja_commentCreate",
+			tool_input: JSON.stringify({ issueId: "HOJA-42", body: "updated" }),
+			tool_response: JSON.stringify({ identifier: "HOJA-42", ok: true }),
+			tool_use_id: "hc1",
+		});
+		expect(readTouchedIssues(dataDir, "s-no-task")).toEqual(["HOJA-42"]);
+
+		// Stop triggers turn_end -> syncSession("turn") without any TaskManage task
+		await hook("Stop", { last_assistant_message: "Done." });
+		const traceCalls = hoja.calls.filter(c => c.url.endsWith("/api/traces"));
+		expect(traceCalls).toHaveLength(1);
+		const posted = JSON.parse(traceCalls[0].init.body);
+		expect(posted.issues).toEqual(["HOJA-42"]);
+		expect(JSON.stringify(posted.trace)).not.toContain("ghp_secretTokenValue1234567890");
+
+		// Duplicate SessionEnd with no new spans/issues does not re-upload.
+		await sessionEnd({ session_id: "s-no-task", transcript_path: transcriptPath, cwd: dir, reason: "other" }, { ...env, HOJA_PLUGIN_DATA: dataDir }, hoja.fetchImpl);
+		expect(hoja.calls.filter(c => c.url.endsWith("/api/traces"))).toHaveLength(1);
+	});
+
+	it("respects trace_detail=metadata and trace_upload=manual/off during Stop and SessionEnd", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "hoja-meta-"));
+		const { transcriptPath } = session(dir);
+		const hoja = fakeHoja({ tracesEndpoint: true });
+		const env = { HOJA_API_URL: "https://h.example/graphql", HOJA_TOKEN: "tok", HOJA_PLUGIN_TRACE_DETAIL: "metadata" };
+		const dataDir = join(dir, "data");
+		const rt = createRuntime({ dataDir, cwd: dir, hoja: false, enforcementMode: "block", trace: { upload: "off", fetchImpl: hoja.fetchImpl, env } });
+		const hook = (event: string, extra: Record<string, unknown> = {}) => rt.bridge.handle(event, { session_id: "s-meta", transcript_path: transcriptPath, cwd: dir, agent_id: "", event, ...extra });
+
+		await hook("UserPromptSubmit", { prompt: "top secret prompt text" });
+		await hook("PostToolUse", { tool_name: "mcp__hoja__hoja_commentCreate", tool_input: JSON.stringify({ issueId: "HOJA-5" }), tool_use_id: "hc2" });
+		await hook("Stop", { last_assistant_message: "ok" });
+		await sessionEnd({ session_id: "s-meta", transcript_path: transcriptPath, cwd: dir, reason: "other" }, { ...env, HOJA_PLUGIN_DATA: dataDir, HOJA_PLUGIN_TRACE_UPLOAD: "off" }, hoja.fetchImpl);
+		expect(hoja.calls).toHaveLength(0);
+		const collected = collectTrace({ dataDir, sessionId: "s-meta", env });
+		expect(collected.source.detail).toBe("metadata");
+		expect(JSON.stringify(collected)).not.toContain("top secret prompt text");
 	});
 });

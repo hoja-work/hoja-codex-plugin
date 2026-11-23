@@ -10,7 +10,7 @@ import { resolveHojaToken, resolveHojaUrl } from "../../vendor/trebol/.pi/lib/cl
 import { collectTrace, hojaLinks, saveTrace } from "./collect.ts";
 import { renderSummary } from "./render.ts";
 import type { HojaTrace } from "./schema.ts";
-import { appendLedger, readLedger, uploadTrace, type FetchLike, type UploadResult } from "./upload.ts";
+import { appendLedger, LegacyTraceEndpointError, readFlushState, readLedger, uploadSessionTrace, uploadTrace, writeFlushState, type FetchLike, type UploadResult } from "./upload.ts";
 import type { TraceDetail, TraceUpload } from "../env.ts";
 
 export interface TraceServiceOptions {
@@ -27,6 +27,7 @@ export interface TraceServiceOptions {
 const ISSUE = /^[A-Za-z0-9]+-\d+$/;
 
 export class TraceService {
+	private syncing = false;
 	constructor(private readonly options: TraceServiceOptions) {}
 
 	private get env() { return this.options.env ?? process.env; }
@@ -89,6 +90,64 @@ export class TraceService {
 			}
 		}
 		return lines;
+	}
+
+	/**
+	 * Task-independent trace sync (turn settle / session end): if any Hoja issue was touched in this session and
+	 * the trace gained spans or new issues since the last upload, upsert the trace idempotently via `/api/traces`.
+	 */
+	async syncSession(reason: "turn" | "session-end"): Promise<string[]> {
+		if (this.options.upload === "off" || this.options.upload === "manual") return [];
+		if (this.syncing || this.uploadProblem()) return [];
+		const trace = this.build();
+		if (!trace || !trace.issues.length) return [];
+		const prev = readFlushState(this.options.dataDir, trace.session.id);
+		const prevIssues = new Set(prev?.lastIssues ?? []);
+		const unchanged = prev && prev.lastSpanCount === trace.spans.length && trace.issues.every(i => prevIssues.has(i));
+		if (unchanged) return [];
+		this.syncing = true;
+		try {
+			saveTrace(this.options.dataDir, trace);
+			const target = { graphqlUrl: resolveHojaUrl(this.env), token: resolveHojaToken(this.env), fetchImpl: this.options.fetchImpl };
+			const out: string[] = [];
+			try {
+				const res = await uploadSessionTrace(trace, trace.issues, target, reason);
+				for (const att of res.attachments) {
+					appendLedger(this.options.dataDir, trace.session.id, {
+						issue: att.issue, at: new Date().toISOString(), url: att.url,
+						attachmentId: att.id, reason,
+					});
+					out.push(`Hoja trace: ${att.updated ? "updated" : "attached"} session trace on ${att.issue} (${att.subtitle}).`);
+				}
+				writeFlushState(this.options.dataDir, trace.session.id, {
+					lastSpanCount: trace.spans.length, lastIssues: [...new Set([...prevIssues, ...trace.issues])], at: new Date().toISOString(),
+				});
+				return out;
+			} catch (error) {
+				if (!(error instanceof LegacyTraceEndpointError)) {
+					this.options.log?.(`session trace sync failed (${reason}): ${(error as Error).message}`);
+					return [];
+				}
+				// Older Hoja server without /api/traces: fall back to once-per-issue attachmentCreate.
+				const uploaded = new Set(readLedger(this.options.dataDir, trace.session.id).filter(e => e.url).map(e => e.issue));
+				for (const issue of trace.issues) {
+					if (uploaded.has(issue)) continue;
+					try {
+						const r = await uploadTrace(trace, issue, target, reason);
+						appendLedger(this.options.dataDir, trace.session.id, { issue, at: new Date().toISOString(), url: r.url, attachmentId: r.attachmentId, reason });
+						out.push(`Hoja trace: attached this session's trace to ${issue} (${r.subtitle}).`);
+					} catch (err) {
+						this.options.log?.(`trace fallback failed for ${issue}: ${(err as Error).message}`);
+					}
+				}
+				writeFlushState(this.options.dataDir, trace.session.id, {
+					lastSpanCount: trace.spans.length, lastIssues: [...new Set([...prevIssues, ...trace.issues])], at: new Date().toISOString(),
+				});
+				return out;
+			}
+		} finally {
+			this.syncing = false;
+		}
 	}
 
 	contentNotice(): string {
