@@ -17,7 +17,6 @@ import { HookBridge, type BridgeOptions } from "./hook-bridge.ts";
 import { resolveMcpUrl, UpstreamMcp } from "./api-proxy.ts";
 import { authFetch, SIGN_IN_HINT } from "./credentials.ts";
 import { credentials } from "./env.ts";
-import { wrapHojaWriter } from "./hoja-writer.ts";
 import { TraceRecorder } from "./trace/recorder.ts";
 import { TraceService } from "./trace/service.ts";
 import type { FetchLike } from "./trace/upload.ts";
@@ -64,11 +63,11 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 	registerTaskHooks(shim.api as any, manager, { enforcementMode: "off", silent: true });
 	// /tasks: Pi opens a read-only TUI browser; Claude Code shows the same widget as text.
 	shim.api.registerCommand("tasks", { description: "Show the read-only task board", handler: () => taskBoard(manager) });
-	// Publication goes through the same client Trebol's hoja-mode uses; the wrapper only adds what Trebol's
-	// createIssue cannot express (the task's description and priority). See src/hoja-writer.ts.
+	// Publication goes through the same client Trebol's hoja-mode uses, unwrapped: Trebol itself sends the task's
+	// description and priority with the create.
 	if (options.hoja !== false) {
 		const client = (options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials) as any })) as object;
-		registerHojaMode(shim.api, wrapHojaWriter(client, () => manager.snapshot().tasks, options.log) as any);
+		registerHojaMode(shim.api, client as any);
 	}
 	// Registered after hoja-mode, so its tool_result handler runs after publication linked the issue and closed it:
 	// a task that just completed gets this session's trace attached to its issue, and the model is told so.

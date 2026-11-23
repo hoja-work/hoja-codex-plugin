@@ -1985,7 +1985,8 @@ var HojaClient = class {
         assigneeId: r.assigneeId,
         stateId: this.stateId(r, state),
         // Only send a parent that an existing issue provided; a caller can never guess an id.
-        ...options.parentId ? { parentId: options.parentId } : {}
+        ...options.parentId ? { parentId: options.parentId } : {},
+        ...Number.isInteger(options.priority) && options.priority >= 0 && options.priority <= 4 ? { priority: options.priority } : {}
       }
     });
     if (!d.issueCreate?.success || !d.issueCreate.issue) throw new Error("Hoja issueCreate did not succeed");
@@ -2026,6 +2027,13 @@ var HojaClient = class {
     const d = await this.gql(`{ issues(first: 50, filter: { description: { contains: ${JSON.stringify(marker)} } }) { nodes { id identifier description } } }`);
     const hit = (d.issues?.nodes ?? []).find((n) => n.description?.includes(marker));
     return hit ? { id: hit.id, identifier: hit.identifier } : void 0;
+  }
+  /** Reconciliation without any text in the issue: issues with exactly this title in this project created since
+   *  `since`, with their bodies so the caller can match the exact description it sent. */
+  async findIssuesByTitle(title, projectId, since) {
+    const filter = { title: { eq: title.slice(0, 250) }, project: { id: { eq: projectId } }, createdAt: { gte: since } };
+    const d = await this.gql(`query($filter: IssueFilter) { issues(first: 20, filter: $filter) { nodes { id identifier description } } }`, { filter });
+    return (d.issues?.nodes ?? []).map((n) => ({ id: n.id, identifier: n.identifier, description: n.description ?? "" }));
   }
   async comment(issueId, body) {
     const d = await this.gql(`mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }`, { input: { issueId, body: body.slice(0, 2e4) } });
@@ -2124,6 +2132,7 @@ function projectTool(client, state) {
 }
 
 // vendor/trebol/extensions/hoja-mode/lifecycle.ts
+var CRITERIA_HEADING = "## Acceptance criteria";
 var MANAGED_START = "<!-- hoja-managed:start -->";
 var MANAGED_END = "<!-- hoja-managed:end -->";
 var DONE_STATE = "Done";
@@ -2159,21 +2168,53 @@ function acceptedCompletion(facts) {
   return facts.status === "completed" && facts.questions.every((question) => !!question.answer);
 }
 function managedSection(facts) {
-  const lines = [MANAGED_START];
-  if (facts.questions.length) {
-    lines.push("**Acceptance criteria**", "");
-    for (const question of facts.questions) lines.push(`- [${question.answer ? "x" : " "}] ${oneLine(question.text) || question.id}`);
-  }
-  lines.push(MANAGED_END);
-  return lines.join("\n");
+  if (!facts.questions.length) return "";
+  return [CRITERIA_HEADING, "", ...facts.questions.map((question) => `- [${question.answer ? "x" : " "}] ${oneLine(question.text) || question.id}`)].join("\n");
 }
-function mergeManagedDescription(existing, section) {
-  const start = existing.indexOf(MANAGED_START);
-  const end = existing.indexOf(MANAGED_END);
-  if (start !== -1 && end > start) return `${existing.slice(0, start)}${section}${existing.slice(end + MANAGED_END.length)}`;
-  if (!existing) return section;
-  const separator = existing.endsWith("\n\n") ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
-  return `${existing}${separator}${section}`;
+var CHECKLIST_ITEM = /^\s*[-*] \[[ xX]\] /;
+function managedRange(text3) {
+  const start = text3.indexOf(MANAGED_START);
+  const end = text3.indexOf(MANAGED_END);
+  if (start !== -1 && end > start) return { start, end: end + MANAGED_END.length };
+  const lines = text3.split("\n");
+  let heading = -1;
+  for (let i = lines.length - 1; i >= 0; i--) if (lines[i].trim() === CRITERIA_HEADING) {
+    heading = i;
+    break;
+  }
+  if (heading === -1) return void 0;
+  let last = heading;
+  for (let i = heading + 1; i < lines.length; i++) {
+    if (CHECKLIST_ITEM.test(lines[i])) last = i;
+    else if (lines[i].trim() !== "" || last > heading) break;
+  }
+  const offset = (line) => lines.slice(0, line).reduce((sum, value) => sum + value.length + 1, 0);
+  return { start: offset(heading), end: offset(last) + lines[last].length };
+}
+function stripLegacyTrail(text3, marker) {
+  const own = /* @__PURE__ */ new Set([`Link marker: ${marker}`, hiddenMarker(marker)]);
+  const lines = text3.split("\n");
+  const kept = lines.filter((line) => !own.has(line.trim()) && !/^Tracked by TaskManage task #[A-Za-z0-9_-]+( in session [A-Za-z0-9_-]+)?\.$/.test(line.trim()));
+  if (kept.length === lines.length) return text3;
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
+}
+function mergeManagedDescription(existing, section, marker) {
+  const text3 = marker ? stripLegacyTrail(existing, marker) : existing;
+  const range = managedRange(text3);
+  if (range) {
+    const before = text3.slice(0, range.start);
+    const after = text3.slice(range.end);
+    if (section) return `${before}${section}${after}`;
+    const head = before.replace(/\s+$/, "");
+    const tail = after.replace(/^\s+/, "");
+    return head && tail ? `${head}
+
+${tail}` : head || tail;
+  }
+  if (!section) return text3;
+  if (!text3) return section;
+  const separator = text3.endsWith("\n\n") ? "" : text3.endsWith("\n") ? "\n" : "\n\n";
+  return `${text3}${separator}${section}`;
 }
 function hasMarkerLine(text3, label, marker) {
   if (!marker) return false;
@@ -2202,25 +2243,31 @@ function evidenceText(evidence) {
   const refs = evidence.split(";").map((ref) => oneLine(ref)).filter(Boolean);
   return refs.map((ref) => ref.includes("`") ? ref : `\`${ref}\``).join(", ");
 }
-function completionComment(facts, marker) {
-  const lines = [`**Completed:** ${oneLine(facts.subject)}`];
-  if (facts.questions.length) {
-    lines.push("");
-    for (const question of facts.questions) {
-      lines.push(`- **${oneLine(question.text) || question.id}**`, "");
-      const answer = (question.answer ?? "(unanswered)").trim().split(/\r?\n/).map((line) => line.trimEnd());
-      for (const line of answer) lines.push(line ? `  ${line}` : "");
-      if (question.evidence) lines.push("", `  Evidence: ${evidenceText(question.evidence)}`);
-      lines.push("");
-    }
-  }
-  if (lines[lines.length - 1] !== "") lines.push("");
-  lines.push(hiddenMarker(marker));
+function completionComment(facts) {
+  const count = facts.questions.length;
+  const lines = [count ? `**Done.** ${count === 1 ? "The acceptance criterion is" : `All ${count} acceptance criteria are`} answered below.` : "**Done.**"];
+  facts.questions.forEach((question, index) => {
+    const bullet = `${index + 1}. `;
+    const indent = " ".repeat(bullet.length);
+    lines.push("", `${bullet}**${oneLine(question.text) || question.id}**`, "");
+    const answer = (question.answer ?? "(unanswered)").trim().split(/\r?\n/).map((line) => line.trimEnd());
+    for (const line of answer) lines.push(line ? `${indent}${line}` : "");
+    if (question.evidence) lines.push("", `${indent}Evidence: ${evidenceText(question.evidence)}`);
+  });
   return lines.join("\n");
 }
+function commentDigest(body) {
+  const canonical = String(body ?? "").replace(/\r\n/g, "\n").split("\n").map((line) => line.trimEnd()).join("\n").trim();
+  let hash = 2166136261;
+  for (const char of canonical) {
+    hash ^= char.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${(hash >>> 0).toString(16).padStart(8, "0")}:${canonical.length}`;
+}
 var stateFor = (facts) => facts.status === "in_progress" ? "In Progress" : "Todo";
-function subissueDescription(facts, marker) {
-  return [facts.description, hiddenMarker(marker), managedSection(facts)].filter(Boolean).join("\n\n");
+function subissueDescription(facts) {
+  return [facts.description, managedSection(facts)].filter(Boolean).join("\n\n");
 }
 async function syncTask(args) {
   const { writer, facts, active, journal, at } = args;
@@ -2248,7 +2295,12 @@ async function syncTask(args) {
     return fail3("sync_read_failed");
   }
   let lifecycle = current();
-  let owned = hasLinkMarker(view.description, args.marker);
+  const createdHere = record2.origin === "created" && record2.issueId === view.id;
+  let owned = createdHere && lifecycle.scope !== "adopted" || hasLinkMarker(view.description, args.marker);
+  if (owned && !createdHere) {
+    save({ ...lifecycle, scope: "owned" }, { origin: "created" });
+    lifecycle = current();
+  }
   if (!owned && lifecycle.scope === "adopted") {
     if (lifecycle.subissue === "pending" || lifecycle.subissue === "unconfirmed")
       return fail3(lifecycle.subissue === "pending" ? "subissue_pending" : "subissue_unconfirmed");
@@ -2266,7 +2318,7 @@ async function syncTask(args) {
     if (!active()) return { record: record2, stopped: true, writes };
     let child;
     try {
-      child = await writer.createIssue(resolved, facts.subject, subissueDescription(facts, args.marker), stateFor(facts), { parentId: view.id });
+      child = await writer.createIssue(resolved, facts.subject, subissueDescription(facts), stateFor(facts), { parentId: view.id });
     } catch (failure) {
       if (failure instanceof HojaRequestError && failure.ambiguous) {
         error = "subissue_ambiguous";
@@ -2285,12 +2337,13 @@ async function syncTask(args) {
       save({ ...current(), subissue: "unconfirmed", error });
       return { record: record2, stopped: false, writes, error };
     }
-    if (!hasLinkMarker(readback.description, args.marker) || (readback.parentId || "") !== view.id) {
+    if (readback.id !== child.id || (readback.parentId || "") !== view.id) {
       error = "subissue_unverified";
       save({ ...current(), subissue: "unconfirmed", error });
       return { record: record2, stopped: false, writes, error };
     }
     save({ ...lifecycle, scope: "owned", subissue: void 0, umbrellaIdentifier: view.identifier }, {
+      origin: "created",
       issueId: readback.id,
       identifier: readback.identifier,
       parentIdentifier: view.identifier ?? record2.parentIdentifier
@@ -2302,7 +2355,7 @@ async function syncTask(args) {
   if (!owned) return fail3("shared_unowned");
   const section = managedSection(facts);
   let changed = false;
-  const desired = mergeManagedDescription(view.description, section);
+  const desired = mergeManagedDescription(view.description, section, args.marker);
   if (desired !== view.description) {
     if (!active()) return { record: record2, stopped: true, writes };
     try {
@@ -2356,15 +2409,19 @@ async function syncTask(args) {
   };
   const revision = answerRevision(facts);
   const commentMarker = answerMarker(args.sessionKey, facts.taskId, revision);
+  const body = completionComment(facts);
+  const digest = commentDigest(body);
+  const isOurs = (comment, key, bodyDigest) => !!bodyDigest && commentDigest(comment) === bodyDigest || !!key && hasAnswerMarker(comment, key);
   const previousMarker = lifecycle.commentMarker;
+  const previousDigest = lifecycle.commentDigest;
   const unresolved = lifecycle.comment === "pending" || lifecycle.comment === "unconfirmed";
   if (unresolved) {
-    const earlierFound = !!previousMarker && view.comments.some((body) => hasAnswerMarker(body, previousMarker));
+    const earlierFound = view.comments.some((comment) => isOurs(comment, previousMarker, previousDigest));
     if (!earlierFound) return fail3(lifecycle.comment === "pending" ? "comment_pending" : "comment_unconfirmed");
-    lifecycle = { ...lifecycle, comment: "posted", commentMarker: previousMarker };
+    lifecycle = { ...lifecycle, comment: "posted", commentMarker: previousMarker, commentDigest: previousDigest };
     save({ ...lifecycle, error: void 0 });
   }
-  const alreadyPosted = view.comments.some((body) => hasAnswerMarker(body, commentMarker));
+  const alreadyPosted = view.comments.some((comment) => isOurs(comment, commentMarker, digest));
   if (!acceptedCompletion(facts)) {
     if (facts.status === "completed") {
       save({ ...lifecycle, error: "completion_unaccepted" });
@@ -2377,10 +2434,10 @@ async function syncTask(args) {
     return { record: record2, stopped: false, writes };
   }
   if (!alreadyPosted) {
-    save({ ...lifecycle, comment: "pending", commentMarker });
+    save({ ...lifecycle, comment: "pending", commentMarker, commentDigest: digest });
     if (!active()) return { record: record2, stopped: true, writes };
     try {
-      await writer.comment(view.id, completionComment(facts, commentMarker));
+      await writer.comment(view.id, body);
     } catch (failure) {
       if (failure instanceof HojaRequestError && failure.ambiguous) {
         error = "comment_ambiguous";
@@ -2400,20 +2457,20 @@ async function syncTask(args) {
       save({ ...current(), comment: "unconfirmed", error });
       return { record: record2, stopped: false, writes, error };
     }
-    if (!check.comments.some((body) => hasAnswerMarker(body, commentMarker))) {
+    if (!check.comments.some((comment) => isOurs(comment, commentMarker, digest))) {
       error = "comment_unverified";
       save({ ...current(), comment: "unconfirmed", error });
       return { record: record2, stopped: false, writes, error };
     }
     view = check;
-    lifecycle = { ...lifecycle, comment: "posted", commentMarker };
+    lifecycle = { ...lifecycle, comment: "posted", commentMarker, commentDigest: digest };
     save({ ...lifecycle, error: void 0 });
   }
   const stateStop = await applyState(DONE_STATE);
   if (stateStop) return stateStop;
   const alreadyClosed = lifecycle.closed === true && lifecycle.comment === "posted" && lifecycle.commentMarker === commentMarker;
   if (!changed && !stateChanged && alreadyClosed) return { record: record2, stopped: false, writes };
-  save({ ...lifecycle, comment: "posted", commentMarker, closed: true, error: void 0 });
+  save({ ...lifecycle, comment: "posted", commentMarker, commentDigest: digest, closed: true, error: void 0 });
   return { record: record2, stopped: false, writes };
 }
 
@@ -2563,9 +2620,10 @@ function taskMarker(sessionKey, taskId) {
   return `hoja-task:${session}:${task}`;
 }
 function issueDescription(input2) {
-  const body = (input2.description ?? "").trim();
-  return [body, hiddenMarker(input2.marker), input2.managed ?? ""].filter(Boolean).join("\n\n");
+  return [(input2.description ?? "").trim(), input2.managed ?? ""].filter(Boolean).join("\n\n");
 }
+var PRIORITY_VALUES = { urgent: 1, high: 2, medium: 3, low: 4 };
+var priorityValue = (priority) => typeof priority === "string" ? PRIORITY_VALUES[priority.trim().toLowerCase()] : void 0;
 function replayHojaRecords(entries) {
   const records = {};
   for (const entry of entries) {
@@ -2610,7 +2668,8 @@ function candidateFor(result, op, task, records) {
     candidate: {
       taskId: String(task.id),
       subject: String(task.subject ?? op.subject ?? "").trim(),
-      description: typeof op.description === "string" ? op.description : void 0,
+      description: typeof op.description === "string" ? op.description : typeof task.description === "string" ? task.description : void 0,
+      priority: priorityValue(task.priority ?? op.priority),
       parentTaskId,
       status: String(task.status ?? "pending"),
       op,
@@ -2644,16 +2703,27 @@ function linkRecord(candidate, issue, project, at, parentIdentifier, substituted
     issueId: issue.id,
     identifier: issue.identifier,
     project,
+    ...scope === "owned" ? { origin: "created" } : {},
     ...parentIdentifier ? { parentIdentifier } : {},
     ...substitutedFrom ? { substitutedFrom } : {},
     lifecycle: { scope }
   });
 }
 function readbackMismatch(view, expected) {
-  if (!hasLinkMarker(view.description, expected.marker)) return "marker_missing";
+  if (expected.marker && !hasLinkMarker(view.description, expected.marker)) return "marker_missing";
+  if (expected.bodyDigest && commentDigest(view.description) !== expected.bodyDigest) return "body_mismatch";
   if (expected.projectId && view.projectId !== expected.projectId) return "project_mismatch";
   if ((expected.parentIssueId || void 0) !== (view.parentId || void 0)) return "parent_mismatch";
   return void 0;
+}
+var RECONCILE_SKEW_MS = 15 * 6e4;
+async function findByFingerprint(writer, previous, applied) {
+  if (!writer.findIssuesByTitle || !previous.title || !previous.projectId) return void 0;
+  const since = new Date(Date.parse(previous.at) - RECONCILE_SKEW_MS);
+  if (Number.isNaN(since.getTime())) return void 0;
+  const taken = new Set(Object.values(applied).filter((r) => r.taskId !== previous.taskId && r.issueId).map((r) => r.issueId));
+  const hits = (await writer.findIssuesByTitle(previous.title, previous.projectId, since.toISOString())).filter((hit) => !taken.has(hit.id) && commentDigest(hit.description) === previous.bodyDigest);
+  return hits.length === 1 ? { id: hits[0].id, identifier: hits[0].identifier } : void 0;
 }
 async function publishBatch(params, batch, context2) {
   const at = context2.now ?? (() => (/* @__PURE__ */ new Date()).toISOString());
@@ -2690,11 +2760,11 @@ async function publishBatch(params, batch, context2) {
     at
   }) : void 0;
   for (const previous of Object.values(context2.records)) {
-    if (previous.state !== "reconciling" || !previous.marker) continue;
+    if (previous.state !== "reconciling" || !(previous.bodyDigest || previous.marker)) continue;
     if (!active()) return stopped();
     let hit;
     try {
-      hit = await writer.findIssueByMarker(previous.marker);
+      hit = previous.bodyDigest ? await findByFingerprint(writer, previous, applied) : await writer.findIssueByMarker(previous.marker);
     } catch {
       block(previous);
       continue;
@@ -2711,7 +2781,8 @@ async function publishBatch(params, batch, context2) {
       block(previous);
       continue;
     }
-    if (readbackMismatch(view, { marker: previous.marker, projectId: previous.projectId, parentIssueId: previous.expectedParentIssueId })) {
+    const proof = previous.bodyDigest ? { bodyDigest: previous.bodyDigest } : { marker: previous.marker };
+    if (readbackMismatch(view, { ...proof, projectId: previous.projectId, parentIssueId: previous.expectedParentIssueId })) {
       block(previous);
       continue;
     }
@@ -2720,8 +2791,10 @@ async function publishBatch(params, batch, context2) {
       identifier: view.identifier,
       project: previous.project,
       marker: previous.marker,
+      origin: "created",
       ...previous.projectId ? { projectId: previous.projectId } : {},
-      ...view.parentIdentifier ? { parentIdentifier: view.parentIdentifier } : {}
+      ...view.parentIdentifier ? { parentIdentifier: view.parentIdentifier } : {},
+      lifecycle: { scope: "owned" }
     }));
   }
   const { candidates, rejected } = publishCandidates(params, batch, applied);
@@ -2815,33 +2888,27 @@ async function publishBatch(params, batch, context2) {
     }
     const parentIssueId = parent?.state === "linked" ? parent.issueId : void 0;
     const marker = taskMarker(context2.sessionKey, candidate.taskId);
-    const description = issueDescription({
-      description: candidate.description,
-      taskId: candidate.taskId,
-      sessionKey: context2.sessionKey,
+    const description = issueDescription({ description: candidate.description, managed: managedSection(candidate.facts) });
+    const title = candidate.subject.slice(0, 250);
+    const fingerprint = {
       marker,
-      managed: managedSection(candidate.facts)
-    });
-    set(record(candidate.taskId, "reconciling", at(), {
-      reason: "write_in_flight",
-      marker,
+      title,
+      bodyDigest: commentDigest(description),
       project: resolved.project,
       projectId: resolved.projectId,
       ...parentIssueId ? { expectedParentIssueId: parentIssueId } : {}
-    }));
+    };
+    set(record(candidate.taskId, "reconciling", at(), { reason: "write_in_flight", ...fingerprint }));
     if (!active()) return stopped();
     let created;
     try {
-      created = await writer.createIssue(resolved, candidate.subject, description, state, parentIssueId ? { parentId: parentIssueId } : {});
+      created = await writer.createIssue(resolved, title, description, state, {
+        ...parentIssueId ? { parentId: parentIssueId } : {},
+        ...candidate.priority !== void 0 ? { priority: candidate.priority } : {}
+      });
     } catch (error) {
       if (error instanceof HojaRequestError && error.ambiguous)
-        set(record(candidate.taskId, "reconciling", at(), {
-          reason: "ambiguous_write",
-          marker,
-          project: resolved.project,
-          projectId: resolved.projectId,
-          ...parentIssueId ? { expectedParentIssueId: parentIssueId } : {}
-        }));
+        set(record(candidate.taskId, "reconciling", at(), { reason: "ambiguous_write", ...fingerprint }));
       else set(record(candidate.taskId, "failed", at(), { reason: "create_failed", project: resolved.project }));
       continue;
     }
@@ -2854,23 +2921,17 @@ async function publishBatch(params, batch, context2) {
         reason: "readback_unverified",
         issueId: created.id,
         identifier: created.identifier,
-        marker,
-        project: resolved.project,
-        projectId: resolved.projectId,
-        ...parentIssueId ? { expectedParentIssueId: parentIssueId } : {}
+        ...fingerprint
       }));
       continue;
     }
-    const mismatch = readbackMismatch(view, { marker, projectId: resolved.projectId, parentIssueId });
+    const mismatch = view.id !== created.id ? "id_mismatch" : readbackMismatch(view, { projectId: resolved.projectId, parentIssueId });
     if (mismatch) {
       set(record(candidate.taskId, "reconciling", at(), {
         reason: "readback_mismatch",
         issueId: created.id,
         identifier: created.identifier,
-        marker,
-        project: resolved.project,
-        projectId: resolved.projectId,
-        ...parentIssueId ? { expectedParentIssueId: parentIssueId } : {}
+        ...fingerprint
       }));
       continue;
     }
@@ -2924,7 +2985,7 @@ var LIFECYCLE_GUIDANCE = {
   completion_unaccepted: "the task is marked completed but at least one acceptance question has no answer, so the issue was NOT closed. Answer the question with evidence on the task, then complete it again.",
   comment_failed: "Hoja rejected the completion comment, so the issue was left open. A later batch retries it.",
   comment_ambiguous: "the completion comment may or may not have been posted. The issue was left open and the comment is never repeated automatically; check it with hoja_get.",
-  comment_unverified: "the completion comment could not be read back after writing, so the issue was left open. Check it with hoja_get; the next batch reconciles by marker.",
+  comment_unverified: "the completion comment could not be read back after writing, so the issue was left open. Check it with hoja_get; the next batch reconciles by the comment text.",
   comment_unconfirmed: "an earlier completion comment is unconfirmed. No second comment was posted and the issue stays open; read its comments with hoja_get before deciding.",
   comment_pending: "an earlier completion comment was journaled but its outcome is unknown (the chat stopped mid-write). No second comment was posted; read the issue's comments with hoja_get before deciding.",
   state_failed: "Hoja rejected the workflow transition; the issue keeps its current state. A later batch retries.",
@@ -2933,7 +2994,7 @@ var LIFECYCLE_GUIDANCE = {
   state_project_unknown: "the issue has no project to resolve workflow states from, so its state was left unchanged.",
   state_unresolved: "the project or team workflow states could not be resolved, so the issue's state was left unchanged.",
   state_target_mismatch: "the resolved project/team is not the issue's own team and project, so no state id was written.",
-  shared_unowned: "this issue was not proven to belong to this task (its description lacks this session's marker), so nothing was written to it. Set metadata.hojaProject and let publication create a session issue, or link an issue this session owns.",
+  shared_unowned: "this issue was not created by this session for this task, so nothing was written to it. Set metadata.hojaProject and let publication create a session issue, or link an issue this session owns.",
   shared_target_mismatch: "the shared issue's team differs from the resolved project's team, so no session sub-issue was created and nothing was written.",
   shared_project_unresolved: "a session sub-issue under the shared issue could not be created because the project did not resolve; the shared issue was left untouched.",
   subissue_failed: "the session sub-issue under the shared issue was rejected, so no lifecycle write was made to either issue.",
@@ -5879,62 +5940,6 @@ function main() {
 }
 if (process.argv[1] && /api-proxy\.(m?js|ts)$/.test(process.argv[1])) main();
 
-// src/hoja-writer.ts
-var TRACKED_BY = /Tracked by TaskManage task #([^\s]+) in session/;
-var LINK_MARKER = /^\s*(?:<!-- |Link marker: )hoja-task:[^:\s]+:([A-Za-z0-9_-]+)(?: -->)?\s*$/m;
-var taskIdOfDescription = (description) => LINK_MARKER.exec(description)?.[1] ?? TRACKED_BY.exec(description)?.[1];
-var PRIORITY_VALUES = { urgent: 1, high: 2, medium: 3, low: 4 };
-var priorityValue = (priority) => typeof priority === "string" ? PRIORITY_VALUES[priority.trim().toLowerCase()] : void 0;
-var withTaskDescription = (description, taskDescription) => {
-  const body = (taskDescription ?? "").trim();
-  if (!body || description.includes(body)) return description;
-  return `${body}
-
-${description}`;
-};
-var PRIORITY_MUTATION = `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`;
-async function writePriority(client, issueId, priority, log) {
-  const c = client;
-  if (!issueId || typeof issueId !== "string" || priority === void 0 || typeof c?.gql !== "function") return false;
-  try {
-    const data = await c.gql(PRIORITY_MUTATION, { id: issueId, input: { priority } });
-    if (!data?.issueUpdate?.success) {
-      log?.(`priority ${priority} for ${issueId} was not confirmed`);
-      return false;
-    }
-    return true;
-  } catch (error) {
-    log?.(`priority ${priority} for ${issueId} failed: ${error.message}`);
-    return false;
-  }
-}
-function wrapHojaWriter(client, tasks, log) {
-  if (!client || typeof client.createIssue !== "function") return client;
-  const taskFor = (description) => {
-    const id = taskIdOfDescription(String(description ?? ""));
-    if (!id) return void 0;
-    try {
-      return tasks().find((task) => String(task?.id) === id);
-    } catch {
-      return void 0;
-    }
-  };
-  const createIssue = async (resolved, title, description, state, options) => {
-    const task = taskFor(description);
-    const body = withTaskDescription(String(description ?? ""), typeof task?.description === "string" ? task.description : void 0);
-    const created = await client.createIssue(resolved, title, body, state, options);
-    await writePriority(client, created?.id, priorityValue(task?.priority), log);
-    return created;
-  };
-  return new Proxy(client, {
-    get(target2, property) {
-      if (property === "createIssue") return createIssue;
-      const value = Reflect.get(target2, property, target2);
-      return typeof value === "function" ? value.bind(target2) : value;
-    }
-  });
-}
-
 // src/trace/recorder.ts
 import { appendFileSync as appendFileSync2, existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync5 } from "node:fs";
 import { join as join4 } from "node:path";
@@ -7181,7 +7186,7 @@ function createRuntime(options) {
   shim.api.registerCommand("tasks", { description: "Show the read-only task board", handler: () => taskBoard(manager) });
   if (options.hoja !== false) {
     const client = options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials) });
-    registerHojaMode(shim.api, wrapHojaWriter(client, () => manager.snapshot().tasks, options.log));
+    registerHojaMode(shim.api, client);
   }
   shim.api.on("tool_result", async (event) => {
     if (event?.toolName !== "TaskManage" || event.isError) return void 0;

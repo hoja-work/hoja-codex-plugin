@@ -218,7 +218,7 @@ You should see the block, a `TaskManage` create and focus, the retried command, 
 
 ## Deviations from Trebol
 
-The vendored code decides everything; the adapter only widens or re-routes four things a host does differently. Each
+The vendored code decides everything; the adapter only widens or re-routes three things a host does differently (published issue content is no longer one: Trebol sends the task's description and priority with the create). Each
 one is covered by a test in `test/reported-bugs.test.ts`.
 
 | Area | Trebol | Here | Why |
@@ -227,7 +227,6 @@ one is covered by a test in `test/reported-bugs.test.ts`.
 | Read-only discovery | its own read tools (`hoja_list`, `hoja_get`, context, history, vault list/get) | also the hosted Hoja API's read tools (`hoja_viewer`, `hoja_workspace`, `hoja_teams`, `hoja_issues`, `hoja_projects`, `hoja_cycles`, `hoja_workflowStates`, `hoja_*Decisions`, inbox, labels, `hoja_extensionActions`, …), `hoja_project action:list` and `hoja_setup` | Trebol never sees the hosted API, so the gate refused a health check until an issue was filed. Writes (`hoja_issueCreate`, `hoja_taskUpdate`, `hoja_commentCreate`, `hoja_extensionActionRun`, `hoja_notificationMarkRead`, every `*Answer`/`*Update`/`*Delete`) stay gated. |
 | Read-only Bash | `isBashReadOnly` over its tokenizer | the same call after dropping pure file-descriptor redirections (`2>&1`, `>&2`, `>/dev/null`, `&>/dev/null`) | Trebol's tokenizer reads the `&` in `2>&1` as a command separator, so `cat file 2>&1` looked like two commands. Redirects to real files are untouched, and Trebol's allowlist stays conservative (`|| true` is still not read-only). |
 | Prompt commands | `hoja:tasks`, `hoja:hoja` are Pi commands | matched in `UserPromptSubmit` (Codex has no `UserPromptExpansion`), with any spelling of the command name, plus the `hoja_setup` tool | A hook that cannot reach the plugin server fails open; the command text then reached the model. |
-| Published issue content | `createIssue(title, description)` — no priority | the task's description is put at the head of the issue body when the create operation omitted it, and its priority is written with one `issueUpdate` after the create | `IssueCreateInput.priority` was never populated, so every issue kept Hoja's default. Only the create path is touched: Trebol's later description writes are proved by exact read-back, so a description added to a task *after* its issue exists still stays local (upstream behaviour). |
 
 ## Development
 
