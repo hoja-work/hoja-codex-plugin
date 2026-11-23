@@ -8,7 +8,8 @@
  * (`duration_ms`) and the gate's decisions. A session whose transcript cannot be read (another host, a pruned file)
  * still gets a trace from hooks alone; `session.basis` says which one it is.
  */
-import { canonicalToolName, ROLLOUT_INJECTED } from "../transcript.ts";
+import { agyResultText, agyToolName, agyUserRequest, canonicalToolName, isAgyTranscriptLine, ROLLOUT_INJECTED } from "../transcript.ts";
+import { agyToolCall } from "../agy.ts";
 import type { HookRecord } from "./recorder.ts";
 import { clip, clipMiddle, FIELD_CAP, Redactor, toolLabel } from "./redact.ts";
 import {
@@ -98,6 +99,8 @@ class Builder {
 	permissionMode?: string;
 	hostVersion?: string;
 	private turnCount = 0;
+	/** Antigravity transcripts carry second-resolution times; hook records time tool calls to the millisecond. */
+	preferHookTimes = false;
 	private readonly full: boolean;
 	readonly redactor: Redactor;
 
@@ -356,6 +359,82 @@ class Builder {
 		closeTurn(lastSeen);
 	}
 
+	/**
+	 * An Antigravity transcript (`brain/<id>/.system_generated/logs/transcript_full.jsonl`), agy 1.5.14:
+	 *   USER_INPUT        the user's turn (<USER_REQUEST> … wrapped in metadata)
+	 *   PLANNER_RESPONSE  one model call: model, input/cache_read/output tokens, thinking, content, tool_calls (no ids)
+	 *   GENERIC           one tool result, answering the previous response's tool_calls in order; status ERROR when it
+	 *                     failed or a hook denied it
+	 * Times are whole seconds, so hook records refine them: a tool result's step index is the `stepIdx` its
+	 * PreToolUse/PostToolUse hooks carry, and the invocation hooks bracket each model call.
+	 */
+	walkAgy(entries: Entry[], rootId: string, hooks: HookRecord[]) {
+		this.preferHookTimes = true;
+		const hookIdByStep = new Map<number, string>();
+		for (const h of hooks) if ((h.event === "PreToolUse" || h.event === "PostToolUse" || h.event === "PostToolUseFailure") && h.stepIdx !== undefined && h.toolUseId) hookIdByStep.set(h.stepIdx, h.toolUseId);
+		const invocations = hooks.filter(h => (h.event === "UserPromptSubmit" || h.event === "PreInvocation") && h.invocationNum !== undefined).map(h => h.at).sort();
+		const marks = hooks.filter(h => h.event === "PreToolUse" || h.event === "PostToolBatch" || h.event === "Stop").map(h => h.at).sort();
+		const planners = entries.filter(e => e.type === "PLANNER_RESPONSE").length;
+		const useInvocations = invocations.length === planners;
+		let turn: TraceSpan | undefined;
+		let pending: { call: any; llm: TraceSpan }[] = [];
+		let planner = 0;
+		let lastSeen: string | undefined;
+		const stamps = entries.map(e => typeof e.created_at === "string" ? e.created_at : undefined);
+		const closeTurn = (end?: string) => {
+			if (!turn) return;
+			turn.end ??= end ?? lastSeen;
+			turn.durationMs = between(turn.start, turn.end);
+			if (turn.status === "running") turn.status = "ok";
+			turn = undefined;
+		};
+		entries.forEach((e, i) => {
+			const ts = stamps[i];
+			if (e.type === "USER_INPUT" && typeof e.content === "string") {
+				closeTurn(lastSeen);
+				this.turnCount++;
+				const prompt = agyUserRequest(e.content);
+				turn = this.add({ id: `turn:${this.turnCount}`, parentId: rootId, kind: "turn", status: "running", start: ts ?? lastSeen ?? new Date(0).toISOString(), name: this.full ? clip(firstLine(this.redactor.scrub(prompt)), 90, false) : `Turn ${this.turnCount}`, attrs: { index: this.turnCount, ...(this.full ? { prompt: this.content(prompt) } : {}) } });
+				this.firstPrompt ??= prompt;
+				pending = [];
+			} else if (e.type === "PLANNER_RESPONSE") {
+				const model = typeof e.model === "string" ? e.model : undefined;
+				if (model) this.models.add(model);
+				const start = useInvocations ? invocations[planner] : ts ?? lastSeen ?? new Date(0).toISOString();
+				const end = useInvocations ? marks.find(m => m > start) ?? stamps.slice(i + 1).find(Boolean) : stamps.slice(i + 1).find(Boolean) ?? ts;
+				planner++;
+				const n = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : 0;
+				const llm = this.add({
+					id: `llm:agy-${e.step_index ?? i}`, parentId: turn?.id ?? rootId, kind: "llm", name: model ?? "model", start, end, durationMs: between(start, end), status: e.status === "ERROR" ? "error" : "ok",
+					attrs: { model, usage: { input_tokens: n(e.input_tokens), output_tokens: n(e.output_tokens), cache_read_tokens: n(e.cache_read_tokens), cache_creation_tokens: 0 }, ...(e.thinking ? { thinking: true } : {}), ...(this.full && typeof e.content === "string" && e.content ? { text: this.content(e.content) } : {}) },
+				});
+				pending = (Array.isArray(e.tool_calls) ? e.tool_calls : []).map((call: any) => ({ call, llm }));
+			} else if (e.type === "GENERIC" && pending.length) {
+				const { call, llm } = pending.shift()!;
+				const tool = agyToolName(call);
+				const mapped = agyToolCall(call).tool_input;
+				const step = typeof e.step_index === "number" ? e.step_index : i;
+				const id = hookIdByStep.get(step) ?? `agy-step-${step}`;
+				const body = agyResultText(typeof e.content === "string" ? e.content : "");
+				const denied = typeof e.error === "string" && /denied by (?:a )?pre-tool hook/i.test(e.error);
+				const exit = /Command exited with code (\d+)/.exec(body);
+				const status: SpanStatus = denied ? "blocked" : e.status === "ERROR" || (exit && exit[1] !== "0") ? "error" : "ok";
+				const span = this.add({
+					id: `tool:${id}`, parentId: turn?.id ?? rootId, kind: "tool", name: this.label(tool, mapped), start: ts ?? llm.end ?? llm.start, end: ts, status,
+					attrs: { tool_name: displayToolName(tool), tool_use_id: id, llmId: llm.id, step, ...(this.full ? { input: this.content(JSON.stringify(call.args ?? {}, null, 1)) } : {}), ...(exit ? { exitCode: Number(exit[1]) } : {}) },
+				});
+				const out = this.content(denied ? String(e.error) : body);
+				if (out) span.attrs![status === "ok" ? "output" : status === "blocked" ? "blockedReason" : "error"] = out;
+				this.toolSpans.set(id, span);
+				this.taskEvents(displayToolName(tool), agyToolCall(call).tool_input, ts, span.id);
+				const path = mapped.file_path;
+				if (/^(Write|Edit|MultiEdit)$/.test(tool) && typeof path === "string") span.attrs!.file = path;
+			}
+			if (ts) lastSeen = ts;
+		});
+		closeTurn(lastSeen);
+	}
+
 	/** TaskManage creates/updates as instants on the timeline: what the agent committed to, and when. */
 	taskEvents(tool: string, input: any, at: string | undefined, spanId: string) {
 		if (tool !== "TaskManage" || !at || !Array.isArray(input?.operations)) return;
@@ -417,6 +496,7 @@ class Builder {
 		if (hooksOnly && turn && !turn.end) { turn.status = "running"; }
 		for (const [id, span] of this.toolSpans) {
 			const p = pre.get(id), q = post.get(id);
+			if (this.preferHookTimes && p && q) { span.start = p.at; span.end = q.at; span.durationMs = between(p.at, q.at); }
 			if (p?.decision === "deny") {
 				span.status = "blocked";
 				span.end ??= p.at;
@@ -446,8 +526,9 @@ export function buildTrace(input: BuildInput): HojaTrace {
 	const root = b.add({ id: rootId, kind: "session", name: "Session", start: "", status: "ok" });
 	const entries = input.transcript ? parseLines(input.transcript) : [];
 	const codex = entries.some(e => e.type === "session_meta" || e.type === "response_item" || e.type === "token_usage_record");
-	const basis: "transcript" | "hooks" = codex || entries.some(e => e.type === "assistant" || e.type === "user") ? "transcript" : "hooks";
-	if (basis === "transcript") { if (codex) b.walkCodex(entries, rootId); else b.walk(entries, rootId); }
+	const agy = !codex && entries.some(e => typeof e.step_index === "number" && (e.type === "USER_INPUT" || e.type === "PLANNER_RESPONSE"));
+	const basis: "transcript" | "hooks" = codex || agy || entries.some(e => e.type === "assistant" || e.type === "user") ? "transcript" : "hooks";
+	if (basis === "transcript") { if (codex) b.walkCodex(entries, rootId); else if (agy) b.walkAgy(entries, rootId, input.hooks); else b.walk(entries, rootId); }
 	for (const sub of input.subagents ?? []) {
 		const subEntries = parseLines(sub.text);
 		if (!subEntries.length) continue;
@@ -517,7 +598,7 @@ export function buildTrace(input: BuildInput): HojaTrace {
 		schema: TRACE_SCHEMA,
 		id: `${input.sessionId}@${root.end}`,
 		createdAt: now,
-		source: { host: input.host ?? (codex ? "codex" : "claude-code"), hostVersion: b.hostVersion, plugin: input.plugin, detail: input.detail ?? "full" },
+		source: { host: input.host ?? (codex ? "codex" : agy ? "antigravity" : "claude-code"), hostVersion: b.hostVersion, plugin: input.plugin, detail: input.detail ?? "full" },
 		session: {
 			id: input.sessionId, title: (input.detail ?? "full") === "full" ? title : undefined, cwd, gitBranch: b.gitBranch, permissionMode: b.permissionMode,
 			models: [...b.models], start: root.start, end: root.end, durationMs: root.durationMs ?? 0, basis,

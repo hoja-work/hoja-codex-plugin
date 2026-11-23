@@ -9,8 +9,9 @@ Trebol's TaskManage, its task-enforcement gate, Hoja issue sync and session trac
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2F855A.svg)](LICENSE)
 [![Codex plugin](https://img.shields.io/badge/Codex-plugin-111111.svg)](https://developers.openai.com/codex/plugins)
-[![Tests](https://img.shields.io/badge/tests-387%20passing-2F855A.svg)](#verify-it-yourself)
+[![Tests](https://img.shields.io/badge/tests-401%20passing-2F855A.svg)](#verify-it-yourself)
 [![Claude Code version](https://img.shields.io/badge/also%20for-Claude%20Code-D97757.svg)](https://github.com/hoja-work/hoja-claude-plugin)
+[![Antigravity version](https://img.shields.io/badge/also%20for-Antigravity-4285F4.svg)](https://github.com/hoja-work/hoja-antigravity-plugin)
 
 </div>
 
@@ -191,7 +192,7 @@ Both always agree.
 git clone https://github.com/hoja-work/hoja-codex-plugin && cd hoja-codex-plugin
 npm ci
 npm run vendor:check   # 53 vendored files match vendor/MANIFEST.json (SHA-256)
-npm test               # Trebol's own 25 suites, unmodified, plus the adapter and trace tests: 387 tests
+npm test               # Trebol's own 25 suites, unmodified, plus the adapter, trace and Antigravity tests: 401 tests
 npm run install:local  # codex plugin marketplace add . && codex plugin add hoja@hoja
 ```
 
@@ -231,7 +232,7 @@ one is covered by a test in `test/reported-bugs.test.ts`.
 ## Development
 
 ```text
-src/            adapter (same source as the Claude Code plugin; HOJA_PLUGIN_HOST=codex selects Codex names and wire shapes)
+src/            adapter (same source as the Claude Code and Antigravity plugins; HOJA_PLUGIN_HOST=codex selects Codex names and wire shapes)
 vendor/trebol/  Trebol files, byte-for-byte (never edit; re-vendor instead)
 dist/           bundled entry points (committed, because plugins run without a build step)
 .codex-plugin/  plugin manifest

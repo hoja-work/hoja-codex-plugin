@@ -3277,9 +3277,15 @@ import { readFileSync as readFileSync3, statSync as statSync3 } from "node:fs";
 var PROFILES = {
   // Claude Code may normalize the server name's hyphen.
   claude: { host: "claude", ownToolPrefixes: ["mcp__plugin_hoja_hoja__"], apiToolPrefixes: ["mcp__plugin_hoja_hoja-api__", "mcp__plugin_hoja_hoja_api__"], bashAliases: [] },
-  codex: { host: "codex", ownToolPrefixes: ["mcp__hoja__"], apiToolPrefixes: ["mcp__hoja_api__", "mcp__hoja-api__"], bashAliases: ["exec_command", "shell", "local_shell", "container.exec"] }
+  codex: { host: "codex", ownToolPrefixes: ["mcp__hoja__"], apiToolPrefixes: ["mcp__hoja_api__", "mcp__hoja-api__"], bashAliases: ["exec_command", "shell", "local_shell", "container.exec"] },
+  // Antigravity names a plugin's MCP server `<plugin>_<server>` and wraps every MCP call in `call_mcp_tool`; agy.ts
+  // unwraps it to `mcp__<ServerName>__<ToolName>`. Its shell tool is `run_command`.
+  antigravity: { host: "antigravity", ownToolPrefixes: ["mcp__hoja_hoja__"], apiToolPrefixes: ["mcp__hoja_hoja-api__", "mcp__hoja_hoja_api__"], bashAliases: ["run_command"] }
 };
-var hostOf = (env = process.env) => env.HOJA_PLUGIN_HOST?.trim().toLowerCase() === "codex" ? "codex" : "claude";
+var hostOf = (env = process.env) => {
+  const v = env.HOJA_PLUGIN_HOST?.trim().toLowerCase();
+  return v === "codex" ? "codex" : v === "antigravity" || v === "agy" ? "antigravity" : "claude";
+};
 var profile = (env = process.env) => PROFILES[hostOf(env)];
 
 // src/transcript.ts
@@ -3302,7 +3308,50 @@ var textParts = (content) => {
 };
 function parseTranscript(text3) {
   const first = text3.slice(0, text3.indexOf("\n") === -1 ? text3.length : text3.indexOf("\n"));
-  return /"type"\s*:\s*"(session_meta|response_item|event_msg|turn_context)"/.test(first) ? parseCodexRollout(text3) : parseClaudeTranscript(text3);
+  if (/"type"\s*:\s*"(session_meta|response_item|event_msg|turn_context)"/.test(first)) return parseCodexRollout(text3);
+  if (isAgyTranscriptLine(first)) return parseAgyTranscript(text3);
+  return parseClaudeTranscript(text3);
+}
+var isAgyTranscriptLine = (line) => /"step_index"\s*:/.test(line) && /"type"\s*:\s*"(USER_INPUT|PLANNER_RESPONSE|GENERIC|SYSTEM_MESSAGE)"/.test(line);
+var agyUserRequest = (content) => /<USER_REQUEST>\n?([\s\S]*?)\n?<\/USER_REQUEST>/.exec(content)?.[1] ?? content;
+var agyResultText = (content) => content.replace(/^(?:(?:Created|Completed) At: [^\n]*\n)+/, "");
+function agyToolName(call) {
+  const name = String(call?.name ?? "tool");
+  if (name === "call_mcp_tool") return canonicalToolName(`mcp__${call.args?.ServerName ?? ""}__${call.args?.ToolName ?? ""}`);
+  const map = { run_command: "Bash", read_file: "Read", view_file: "Read", write_file: "Write", edit_file: "Edit", replace_file_content: "Edit", multi_replace_file_content: "MultiEdit", apply_patch: "Edit", list_dir: "LS", list_directory: "LS", grep_search: "Grep", find_by_name: "Glob", search_web: "WebSearch", read_url_content: "WebFetch", tool_search: "ToolSearch" };
+  return map[name] ?? name;
+}
+function parseAgyTranscript(text3) {
+  const out = [];
+  let pending = [];
+  for (const line of text3.split("\n")) {
+    if (!line.trim()) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e?.type === "USER_INPUT" && typeof e.content === "string") {
+      pending = [];
+      out.push({ role: "user", content: [{ type: "text", text: agyUserRequest(e.content) }] });
+    } else if (e?.type === "PLANNER_RESPONSE") {
+      const parts = [];
+      if (typeof e.content === "string" && e.content) parts.push({ type: "text", text: e.content });
+      const calls = Array.isArray(e.tool_calls) ? e.tool_calls : [];
+      pending = calls.map((call, i) => ({ id: `agy-${e.step_index}-${i}`, name: agyToolName(call) }));
+      for (const p of pending) parts.push({ type: "toolCall", id: p.id, name: p.name });
+      out.push({ role: "assistant", content: parts, stopReason: calls.length ? "toolUse" : "stop" });
+    } else if (e?.type === "GENERIC" && pending.length) {
+      const call = pending.shift();
+      let body = agyResultText(typeof e.content === "string" ? e.content : "");
+      const denied = typeof e.error === "string" ? /denied by (?:a )?pre-tool hook:\s*([\s\S]*)$/.exec(e.error) : null;
+      if (denied) body = `blocked by hook: ${denied[1]}`;
+      const exit = /Command exited with code (\d+)/.exec(body);
+      out.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content: body ? [{ type: "text", text: body }] : [], isError: e.status === "ERROR" || !!exit && exit[1] !== "0" });
+    }
+  }
+  return out;
 }
 var ROLLOUT_INJECTED = /^\s*<(environment_context|user_instructions|permissions instructions|skills_instructions|turn_aborted|subagent_notification)\b/;
 var rolloutText = (content) => Array.isArray(content) ? content.flatMap((part) => (part?.type === "input_text" || part?.type === "output_text" || part?.type === "text") && typeof part.text === "string" && part.text ? [{ type: "text", text: part.text }] : []) : textParts(content);
@@ -5158,6 +5207,50 @@ function evaluateTaskGateResume(input2) {
   };
 }
 
+// src/agy.ts
+var BUILTINS = {
+  run_command: { name: "Bash", args: (a) => ({ ...a, command: a.CommandLine ?? a.command }) },
+  read_file: { name: "Read", args: (a) => ({ ...a, file_path: a.Path ?? a.AbsolutePath }) },
+  view_file: { name: "Read", args: (a) => ({ ...a, file_path: a.Path ?? a.AbsolutePath }) },
+  list_dir: { name: "LS", args: (a) => ({ ...a, path: a.Path ?? a.DirectoryPath }) },
+  list_directory: { name: "LS", args: (a) => ({ ...a, path: a.Path ?? a.DirectoryPath }) },
+  grep_search: { name: "Grep", args: (a) => ({ ...a, pattern: a.Query ?? a.Pattern }) },
+  find_by_name: { name: "Glob", args: (a) => ({ ...a, pattern: a.Pattern ?? a.Name }) },
+  glob: { name: "Glob" },
+  code_search: { name: "CodeSearch" },
+  search_web: { name: "WebSearch", args: (a) => ({ ...a, query: a.Query ?? a.query }) },
+  read_url_content: { name: "WebFetch", args: (a) => ({ ...a, url: a.Url ?? a.url }) },
+  tool_search: { name: "ToolSearch" },
+  write_file: { name: "Write", args: (a) => ({ ...a, file_path: a.Path ?? a.TargetFile, content: a.Content }) },
+  edit_file: { name: "Edit", args: (a) => ({ ...a, file_path: a.Path ?? a.TargetFile }) },
+  replace_file_content: { name: "Edit", args: (a) => ({ ...a, file_path: a.Path ?? a.TargetFile }) },
+  multi_replace_file_content: { name: "MultiEdit", args: (a) => ({ ...a, file_path: a.Path ?? a.TargetFile }) },
+  apply_patch: { name: "Edit" }
+};
+var AGY_READ_ONLY = ["command_status", "read_terminal", "view_code_item", "ask_question", "notify_user", "task_boundary", "read_resource", "list_resources"];
+function agyToolCall(call) {
+  const name = String(call?.name ?? "");
+  const args = call?.args && typeof call.args === "object" ? call.args : {};
+  const id = typeof call?.id === "string" ? call.id : void 0;
+  if (name === "call_mcp_tool") {
+    const server = String(args.ServerName ?? "");
+    const tool = String(args.ToolName ?? "");
+    const input2 = args.Arguments && typeof args.Arguments === "object" ? args.Arguments : typeof args.Arguments === "string" ? safeJson(args.Arguments) : {};
+    return { tool_name: `mcp__${server}__${tool}`, tool_input: input2, tool_use_id: id };
+  }
+  const builtin = BUILTINS[name];
+  if (!builtin) return { tool_name: name, tool_input: args, tool_use_id: id };
+  return { tool_name: builtin.name, tool_input: builtin.args ? builtin.args(args) : args, tool_use_id: id };
+}
+var safeJson = (s) => {
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+};
+
 // src/host-policy.ts
 var bare = (name) => name.replace(/^mcp__[A-Za-z0-9_-]+__/, "");
 var policyName = (name) => bare(name).replace(/_/g, "").toLowerCase();
@@ -5200,7 +5293,9 @@ var READ_ONLY_HOST_TOOLS = [
   "hoja_inboxNotifications",
   "hoja_inboxUnreadCount",
   // extension action catalogue (running one is hoja_extensionActionRun and stays gated)
-  "hoja_extensionActions"
+  "hoja_extensionActions",
+  // Antigravity built-ins that only read a terminal or a resource, or only talk to the user (agy.ts AGY_READ_ONLY)
+  ...AGY_READ_ONLY
 ];
 var READ_ONLY_HOST = new Set(READ_ONLY_HOST_TOOLS.map(policyName));
 var isAdapterReadOnlyTool = (toolName2, params) => {
@@ -5297,6 +5392,8 @@ var HookBridge = class {
   headless;
   recorder;
   host;
+  /** Antigravity: a PreToolUse answer cannot carry context, so a nudge waits for the next model call. */
+  deferred = [];
   /** Codex: PreToolUse calls not yet settled by PostToolUse, so the turn flushes once per tool batch. */
   inFlight = /* @__PURE__ */ new Set();
   /** Tasks as the Swarm hooks see them (swarm-builtin-hooks-runtime.ts hookTasks). */
@@ -5397,6 +5494,10 @@ var HookBridge = class {
       return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: block } };
     }
     this.inFlight.add(toolCallId ?? `anon-${this.inFlight.size}`);
+    if (pre && this.host === "antigravity") {
+      this.deferred.push(pre);
+      return {};
+    }
     return pre ? context("PreToolUse", pre) : {};
   }
   async postTool(payload, failed2) {
@@ -5416,7 +5517,7 @@ var HookBridge = class {
   }
   async turnEnd(hookEventName = "PostToolBatch") {
     await this.shim.emit("turn_end");
-    const content = this.pipeline.flushTurn();
+    const content = [...this.deferred.splice(0), this.pipeline.flushTurn()].filter(Boolean).join("\n\n");
     return content ? context(hookEventName, content) : {};
   }
   stop(payload) {
@@ -5428,7 +5529,7 @@ var HookBridge = class {
       messages.push({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: String(payload.last_assistant_message ?? "") }] });
     const decision = evaluateTaskGateResume({ session, messages, taskFocused: hasFocusedTask(this.tasks()), budget: this.gateResume });
     if (decision.action === "continue" && decision.content)
-      return this.host === "codex" ? { decision: "block", reason: decision.content } : context("Stop", decision.content);
+      return this.host === "codex" ? { decision: "block", reason: decision.content } : this.host === "antigravity" ? { decision: "continue", reason: decision.content } : context("Stop", decision.content);
     if (decision.action === "exhausted" && decision.content) return { systemMessage: decision.content };
     return {};
   }
@@ -5599,7 +5700,9 @@ function applyCredentials() {
 function dataDir(env = process.env, script = process.argv[1]) {
   const explicit = env.HOJA_PLUGIN_DATA?.trim() || env.CLAUDE_PLUGIN_DATA?.trim() || env.PLUGIN_DATA?.trim();
   if (explicit) return explicit;
-  if (env.HOJA_PLUGIN_HOST?.trim().toLowerCase() !== "codex") return join3(homedir(), ".claude", "plugins", "data", "hoja-standalone");
+  const host = env.HOJA_PLUGIN_HOST?.trim().toLowerCase();
+  if (host === "antigravity" || host === "agy") return join3(homedir(), ".gemini", "antigravity-cli", "plugin-data", "hoja");
+  if (host !== "codex") return join3(homedir(), ".claude", "plugins", "data", "hoja-standalone");
   const installed = script ? /^(.*)[\\/]plugins[\\/]cache[\\/]([^\\/]+)[\\/]([^\\/]+)[\\/][^\\/]+$/.exec(resolve2(dirname2(resolve2(script)), "..")) : null;
   if (installed) return join3(installed[1], "plugins", "data", `${installed[3]}-${installed[2]}`);
   return join3(env.CODEX_HOME?.trim() || join3(homedir(), ".codex"), "plugins", "data", "hoja-standalone");
@@ -5952,7 +6055,9 @@ var TraceRecorder = class {
       toolUseId: str(payload.tool_use_id),
       durationMs: num(payload.duration_ms),
       permissionMode: str(payload.permission_mode),
-      model: typeof payload.model === "string" ? payload.model : str(payload.model?.id)
+      model: typeof payload.model === "string" ? payload.model : str(payload.model?.id),
+      stepIdx: num(payload.step_idx),
+      invocationNum: num(payload.invocation_num)
     };
     if (event === "PreToolUse") {
       if (hso.permissionDecision === "deny") {
@@ -6096,6 +6201,8 @@ var Builder = class {
   permissionMode;
   hostVersion;
   turnCount = 0;
+  /** Antigravity transcripts carry second-resolution times; hook records time tool calls to the millisecond. */
+  preferHookTimes = false;
   full;
   redactor;
   /** Whole content, scrubbed; capped only at FIELD_CAP (head and tail kept). */
@@ -6371,6 +6478,94 @@ ${text3}` : text3);
     }
     closeTurn(lastSeen);
   }
+  /**
+   * An Antigravity transcript (`brain/<id>/.system_generated/logs/transcript_full.jsonl`), agy 1.5.14:
+   *   USER_INPUT        the user's turn (<USER_REQUEST> … wrapped in metadata)
+   *   PLANNER_RESPONSE  one model call: model, input/cache_read/output tokens, thinking, content, tool_calls (no ids)
+   *   GENERIC           one tool result, answering the previous response's tool_calls in order; status ERROR when it
+   *                     failed or a hook denied it
+   * Times are whole seconds, so hook records refine them: a tool result's step index is the `stepIdx` its
+   * PreToolUse/PostToolUse hooks carry, and the invocation hooks bracket each model call.
+   */
+  walkAgy(entries, rootId, hooks) {
+    this.preferHookTimes = true;
+    const hookIdByStep = /* @__PURE__ */ new Map();
+    for (const h of hooks) if ((h.event === "PreToolUse" || h.event === "PostToolUse" || h.event === "PostToolUseFailure") && h.stepIdx !== void 0 && h.toolUseId) hookIdByStep.set(h.stepIdx, h.toolUseId);
+    const invocations = hooks.filter((h) => (h.event === "UserPromptSubmit" || h.event === "PreInvocation") && h.invocationNum !== void 0).map((h) => h.at).sort();
+    const marks = hooks.filter((h) => h.event === "PreToolUse" || h.event === "PostToolBatch" || h.event === "Stop").map((h) => h.at).sort();
+    const planners = entries.filter((e) => e.type === "PLANNER_RESPONSE").length;
+    const useInvocations = invocations.length === planners;
+    let turn;
+    let pending = [];
+    let planner = 0;
+    let lastSeen;
+    const stamps = entries.map((e) => typeof e.created_at === "string" ? e.created_at : void 0);
+    const closeTurn = (end) => {
+      if (!turn) return;
+      turn.end ??= end ?? lastSeen;
+      turn.durationMs = between(turn.start, turn.end);
+      if (turn.status === "running") turn.status = "ok";
+      turn = void 0;
+    };
+    entries.forEach((e, i) => {
+      const ts = stamps[i];
+      if (e.type === "USER_INPUT" && typeof e.content === "string") {
+        closeTurn(lastSeen);
+        this.turnCount++;
+        const prompt = agyUserRequest(e.content);
+        turn = this.add({ id: `turn:${this.turnCount}`, parentId: rootId, kind: "turn", status: "running", start: ts ?? lastSeen ?? (/* @__PURE__ */ new Date(0)).toISOString(), name: this.full ? clip2(firstLine(this.redactor.scrub(prompt)), 90, false) : `Turn ${this.turnCount}`, attrs: { index: this.turnCount, ...this.full ? { prompt: this.content(prompt) } : {} } });
+        this.firstPrompt ??= prompt;
+        pending = [];
+      } else if (e.type === "PLANNER_RESPONSE") {
+        const model = typeof e.model === "string" ? e.model : void 0;
+        if (model) this.models.add(model);
+        const start = useInvocations ? invocations[planner] : ts ?? lastSeen ?? (/* @__PURE__ */ new Date(0)).toISOString();
+        const end = useInvocations ? marks.find((m) => m > start) ?? stamps.slice(i + 1).find(Boolean) : stamps.slice(i + 1).find(Boolean) ?? ts;
+        planner++;
+        const n = (v) => typeof v === "number" && Number.isFinite(v) ? v : 0;
+        const llm = this.add({
+          id: `llm:agy-${e.step_index ?? i}`,
+          parentId: turn?.id ?? rootId,
+          kind: "llm",
+          name: model ?? "model",
+          start,
+          end,
+          durationMs: between(start, end),
+          status: e.status === "ERROR" ? "error" : "ok",
+          attrs: { model, usage: { input_tokens: n(e.input_tokens), output_tokens: n(e.output_tokens), cache_read_tokens: n(e.cache_read_tokens), cache_creation_tokens: 0 }, ...e.thinking ? { thinking: true } : {}, ...this.full && typeof e.content === "string" && e.content ? { text: this.content(e.content) } : {} }
+        });
+        pending = (Array.isArray(e.tool_calls) ? e.tool_calls : []).map((call) => ({ call, llm }));
+      } else if (e.type === "GENERIC" && pending.length) {
+        const { call, llm } = pending.shift();
+        const tool = agyToolName(call);
+        const mapped = agyToolCall(call).tool_input;
+        const step = typeof e.step_index === "number" ? e.step_index : i;
+        const id = hookIdByStep.get(step) ?? `agy-step-${step}`;
+        const body = agyResultText(typeof e.content === "string" ? e.content : "");
+        const denied = typeof e.error === "string" && /denied by (?:a )?pre-tool hook/i.test(e.error);
+        const exit = /Command exited with code (\d+)/.exec(body);
+        const status = denied ? "blocked" : e.status === "ERROR" || exit && exit[1] !== "0" ? "error" : "ok";
+        const span = this.add({
+          id: `tool:${id}`,
+          parentId: turn?.id ?? rootId,
+          kind: "tool",
+          name: this.label(tool, mapped),
+          start: ts ?? llm.end ?? llm.start,
+          end: ts,
+          status,
+          attrs: { tool_name: displayToolName(tool), tool_use_id: id, llmId: llm.id, step, ...this.full ? { input: this.content(JSON.stringify(call.args ?? {}, null, 1)) } : {}, ...exit ? { exitCode: Number(exit[1]) } : {} }
+        });
+        const out = this.content(denied ? String(e.error) : body);
+        if (out) span.attrs[status === "ok" ? "output" : status === "blocked" ? "blockedReason" : "error"] = out;
+        this.toolSpans.set(id, span);
+        this.taskEvents(displayToolName(tool), agyToolCall(call).tool_input, ts, span.id);
+        const path = mapped.file_path;
+        if (/^(Write|Edit|MultiEdit)$/.test(tool) && typeof path === "string") span.attrs.file = path;
+      }
+      if (ts) lastSeen = ts;
+    });
+    closeTurn(lastSeen);
+  }
   /** TaskManage creates/updates as instants on the timeline: what the agent committed to, and when. */
   taskEvents(tool, input2, at, spanId) {
     if (tool !== "TaskManage" || !at || !Array.isArray(input2?.operations)) return;
@@ -6443,6 +6638,11 @@ ${text3}` : text3);
     }
     for (const [id, span] of this.toolSpans) {
       const p = pre.get(id), q2 = post.get(id);
+      if (this.preferHookTimes && p && q2) {
+        span.start = p.at;
+        span.end = q2.at;
+        span.durationMs = between(p.at, q2.at);
+      }
       if (p?.decision === "deny") {
         span.status = "blocked";
         span.end ??= p.at;
@@ -6472,9 +6672,11 @@ function buildTrace(input2) {
   const root = b.add({ id: rootId, kind: "session", name: "Session", start: "", status: "ok" });
   const entries = input2.transcript ? parseLines(input2.transcript) : [];
   const codex = entries.some((e) => e.type === "session_meta" || e.type === "response_item" || e.type === "token_usage_record");
-  const basis = codex || entries.some((e) => e.type === "assistant" || e.type === "user") ? "transcript" : "hooks";
+  const agy = !codex && entries.some((e) => typeof e.step_index === "number" && (e.type === "USER_INPUT" || e.type === "PLANNER_RESPONSE"));
+  const basis = codex || agy || entries.some((e) => e.type === "assistant" || e.type === "user") ? "transcript" : "hooks";
   if (basis === "transcript") {
     if (codex) b.walkCodex(entries, rootId);
+    else if (agy) b.walkAgy(entries, rootId, input2.hooks);
     else b.walk(entries, rootId);
   }
   for (const sub of input2.subagents ?? []) {
@@ -6547,7 +6749,7 @@ function buildTrace(input2) {
     schema: TRACE_SCHEMA,
     id: `${input2.sessionId}@${root.end}`,
     createdAt: now,
-    source: { host: input2.host ?? (codex ? "codex" : "claude-code"), hostVersion: b.hostVersion, plugin: input2.plugin, detail: input2.detail ?? "full" },
+    source: { host: input2.host ?? (codex ? "codex" : agy ? "antigravity" : "claude-code"), hostVersion: b.hostVersion, plugin: input2.plugin, detail: input2.detail ?? "full" },
     session: {
       id: input2.sessionId,
       title: (input2.detail ?? "full") === "full" ? title : void 0,
@@ -6609,7 +6811,7 @@ function fitTrace(trace, limit = 8 * 1024 * 1024) {
 }
 
 // src/trace/collect.ts
-var PLUGIN_VERSION = "0.4.1";
+var PLUGIN_VERSION = "0.5.0";
 var HOJA_TASK_ENTRY2 = "hoja-task-link";
 var TASK_STATE_ENTRY = "pi-swarm-task-state";
 function hojaLinks(entries) {
@@ -6693,7 +6895,7 @@ function collectTrace(options) {
     hooks,
     tasks: traceTasks(options.tasks ?? journalTasks(journal), links),
     plugin: `hoja@${PLUGIN_VERSION}`,
-    host: options.host ?? (hostOf() === "codex" ? "codex" : void 0),
+    host: options.host ?? (hostOf() === "claude" ? void 0 : hostOf()),
     detail: options.detail,
     redactor: new Redactor(options.env ?? process.env),
     now: options.now,
@@ -6769,7 +6971,7 @@ function renderSummary(trace, extra = {}) {
 // src/trace/upload.ts
 import { existsSync as existsSync5, readFileSync as readFileSync7, writeFileSync as writeFileSync3, mkdirSync as mkdirSync5 } from "node:fs";
 import { join as join6 } from "node:path";
-var HOSTS = { "claude-code": { slug: "claude-code", name: "Claude Code" }, codex: { slug: "codex", name: "Codex" } };
+var HOSTS = { "claude-code": { slug: "claude-code", name: "Claude Code" }, codex: { slug: "codex", name: "Codex" }, antigravity: { slug: "antigravity", name: "Antigravity" } };
 var hostOf2 = (trace) => HOSTS[trace.source.host] ?? { slug: trace.source.host.replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "agent", name: trace.source.host };
 function traceFileName(trace) {
   const stamp = trace.session.end.replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z").replace("T", "-");

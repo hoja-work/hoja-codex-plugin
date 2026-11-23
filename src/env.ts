@@ -37,7 +37,11 @@ export function applyCredentials(): Credentials {
 export function dataDir(env: NodeJS.ProcessEnv = process.env, script = process.argv[1]): string {
 	const explicit = env.HOJA_PLUGIN_DATA?.trim() || env.CLAUDE_PLUGIN_DATA?.trim() || env.PLUGIN_DATA?.trim();
 	if (explicit) return explicit;
-	if (env.HOJA_PLUGIN_HOST?.trim().toLowerCase() !== "codex") return join(homedir(), ".claude", "plugins", "data", "hoja-standalone");
+	const host = env.HOJA_PLUGIN_HOST?.trim().toLowerCase();
+	// Antigravity gives an installed plugin's hooks and MCP servers the same PLUGIN_DATA (handled above); a plugin
+	// loaded from a workspace `.agents/plugins/` gets none, so both fall back to one fixed directory.
+	if (host === "antigravity" || host === "agy") return join(homedir(), ".gemini", "antigravity-cli", "plugin-data", "hoja");
+	if (host !== "codex") return join(homedir(), ".claude", "plugins", "data", "hoja-standalone");
 	const installed = script ? /^(.*)[\\/]plugins[\\/]cache[\\/]([^\\/]+)[\\/]([^\\/]+)[\\/][^\\/]+$/.exec(resolve(dirname(resolve(script)), "..")) : null;
 	if (installed) return join(installed[1], "plugins", "data", `${installed[3]}-${installed[2]}`);
 	return join(env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "plugins", "data", "hoja-standalone");

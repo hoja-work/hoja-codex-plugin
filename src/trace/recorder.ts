@@ -37,6 +37,9 @@ export interface HookRecord {
 	model?: string;
 	transcriptPath?: string;
 	agentTranscriptPath?: string;
+	/** Antigravity: the transcript step a tool call's result lands in, and which model call of the turn this is. */
+	stepIdx?: number;
+	invocationNum?: number;
 }
 
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/;
@@ -83,6 +86,8 @@ export class TraceRecorder {
 			durationMs: num(payload.duration_ms),
 			permissionMode: str(payload.permission_mode),
 			model: typeof payload.model === "string" ? payload.model : str(payload.model?.id),
+			stepIdx: num(payload.step_idx),
+			invocationNum: num(payload.invocation_num),
 		};
 		if (event === "PreToolUse") {
 			if (hso.permissionDecision === "deny") { record.decision = "deny"; record.reason = this.content(hso.permissionDecisionReason) ?? "blocked"; }

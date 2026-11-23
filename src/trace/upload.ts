@@ -16,7 +16,7 @@ export type FetchLike = (url: string, init: { method: string; headers: Record<st
 export interface UploadTarget { graphqlUrl: string; token: string; fetchImpl?: FetchLike; timeoutMs?: number }
 export interface UploadResult { issue: string; url: string; attachmentId?: string; title: string; subtitle: string; bytes: number }
 
-const HOSTS: Record<string, { slug: string; name: string }> = { "claude-code": { slug: "claude-code", name: "Claude Code" }, codex: { slug: "codex", name: "Codex" } };
+const HOSTS: Record<string, { slug: string; name: string }> = { "claude-code": { slug: "claude-code", name: "Claude Code" }, codex: { slug: "codex", name: "Codex" }, antigravity: { slug: "antigravity", name: "Antigravity" } };
 const hostOf = (trace: HojaTrace) => HOSTS[trace.source.host] ?? { slug: trace.source.host.replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "agent", name: trace.source.host };
 
 export function traceFileName(trace: HojaTrace): string {

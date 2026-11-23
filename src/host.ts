@@ -2,7 +2,7 @@
  * The agent host this adapter runs under. The vendored Trebol code is host-agnostic; only names and hook wire shapes
  * differ. Claude Code is the default; the Codex plugin sets HOJA_PLUGIN_HOST=codex on its MCP server and hooks.
  */
-export type Host = "claude" | "codex";
+export type Host = "claude" | "codex" | "antigravity";
 
 export interface HostProfile {
 	host: Host;
@@ -18,7 +18,13 @@ const PROFILES: Record<Host, HostProfile> = {
 	// Claude Code may normalize the server name's hyphen.
 	claude: { host: "claude", ownToolPrefixes: ["mcp__plugin_hoja_hoja__"], apiToolPrefixes: ["mcp__plugin_hoja_hoja-api__", "mcp__plugin_hoja_hoja_api__"], bashAliases: [] },
 	codex: { host: "codex", ownToolPrefixes: ["mcp__hoja__"], apiToolPrefixes: ["mcp__hoja_api__", "mcp__hoja-api__"], bashAliases: ["exec_command", "shell", "local_shell", "container.exec"] },
+	// Antigravity names a plugin's MCP server `<plugin>_<server>` and wraps every MCP call in `call_mcp_tool`; agy.ts
+	// unwraps it to `mcp__<ServerName>__<ToolName>`. Its shell tool is `run_command`.
+	antigravity: { host: "antigravity", ownToolPrefixes: ["mcp__hoja_hoja__"], apiToolPrefixes: ["mcp__hoja_hoja-api__", "mcp__hoja_hoja_api__"], bashAliases: ["run_command"] },
 };
 
-export const hostOf = (env: NodeJS.ProcessEnv = process.env): Host => env.HOJA_PLUGIN_HOST?.trim().toLowerCase() === "codex" ? "codex" : "claude";
+export const hostOf = (env: NodeJS.ProcessEnv = process.env): Host => {
+	const v = env.HOJA_PLUGIN_HOST?.trim().toLowerCase();
+	return v === "codex" ? "codex" : v === "antigravity" || v === "agy" ? "antigravity" : "claude";
+};
 export const profile = (env: NodeJS.ProcessEnv = process.env): HostProfile => PROFILES[hostOf(env)];
