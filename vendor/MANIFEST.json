@@ -1,6 +1,6 @@
 {
   "source": "cloverinternational/trebol",
-  "sourceCommit": "c3a281325b51226f1d492f89d8b0ae8541f1c02b",
+  "sourceCommit": "4f7490e5f290f075adb4465b915b7444287ab9ca",
   "files": {
     "packages/tools/taskmanage/src/task-manage.ts": "85fb9f1f9cac99c654f24395843d3e92f0b9dbcb0ea3bb8cb3dfa44ae62e29b9",
     "packages/tools/taskmanage/src/swarm-validate.ts": "4d7da5a30e8b2bf5ec5bc044be969c786fbd4880cb62ede62def5d8027766a6f",
