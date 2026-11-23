@@ -99,6 +99,22 @@ variables (`env_vars` in [`.mcp.json`](.mcp.json)):
 Like Trebol, there is **no default endpoint**: Hoja calls fail closed with a message naming the variable to set.
 Without credentials, TaskManage and the gate still work and publication is skipped.
 
+## Updates
+
+Codex never updates a plugin by itself. To update:
+
+```bash
+codex plugin marketplace upgrade && codex plugin add hoja@hoja
+```
+
+Then restart Codex.
+
+At most once a day (six hours after a failed attempt) the SessionStart hook reads the version in this repository's
+`package.json` on GitHub. That is a plain request with nothing about you in it, it gives up after 1.5 s, and the answer
+is cached in the plugin's data directory. When a newer version exists, Codex shows one line at session start (the hook's `systemMessage`; it never enters the model's context) with the exact
+update command. Offline or rate-limited means no notice, never an error. Set `HOJA_PLUGIN_UPDATE_CHECK=off` to turn the
+check off.
+
 ## Session traces
 
 The hook bridge appends every hook event to `$CODEX_HOME/plugins/data/hoja-hoja/traces/<session>.events.jsonl`. When a

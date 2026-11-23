@@ -1,7 +1,7 @@
 // Built by scripts/build.mjs from src/ and vendor/trebol/ (see vendor/MANIFEST.json). Do not edit.
 
 // src/agy-hook.ts
-import { appendFileSync as appendFileSync3, readFileSync as readFileSync10 } from "node:fs";
+import { appendFileSync as appendFileSync3, readFileSync as readFileSync11 } from "node:fs";
 
 // src/agy.ts
 var BUILTINS = {
@@ -136,7 +136,7 @@ function findSocket(env = process.env, start = process.ppid, parent = parentOf) 
   return void 0;
 }
 function request(path, message, timeoutMs = 2e4) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const socket = createConnection(path);
     let data = "";
     const timer = setTimeout(() => {
@@ -151,7 +151,7 @@ function request(path, message, timeoutMs = 2e4) {
     socket.on("end", () => {
       clearTimeout(timer);
       try {
-        resolve4(JSON.parse(data));
+        resolve5(JSON.parse(data));
       } catch (error) {
         reject(error);
       }
@@ -321,7 +321,7 @@ function traceDetail(env = process.env) {
 }
 
 // src/session-start.ts
-import { readFileSync as readFileSync9 } from "node:fs";
+import { readFileSync as readFileSync10 } from "node:fs";
 
 // vendor/trebol/packages/tools/taskmanage/src/persistence.ts
 var CURRENT_SCHEMA_VERSION = 2;
@@ -617,8 +617,8 @@ function goMapOrdered(batch) {
 var OPERATION_FIELDS = Object.fromEntries(Object.entries(ALLOWED).map(([op, fields]) => [op, ["key", "op", ...fields]]));
 var fail2 = (code, message, retryable = false) => ({ code, message, retryable });
 function splitEvidence(evidence) {
-  const parts = evidence.split(/[;,]\s*(?=tool:[^\s;,]*|[^\s;,]*(?:\/|\.[A-Za-z0-9]{1,8}(?:#|$)))/g).map((part) => part.trim()).filter(Boolean);
-  return parts.length ? parts : [evidence.trim()];
+  const parts2 = evidence.split(/[;,]\s*(?=tool:[^\s;,]*|[^\s;,]*(?:\/|\.[A-Za-z0-9]{1,8}(?:#|$)))/g).map((part) => part.trim()).filter(Boolean);
+  return parts2.length ? parts2 : [evidence.trim()];
 }
 var clone = (x) => structuredClone(x);
 var isObj2 = (x) => !!x && typeof x === "object" && !Array.isArray(x);
@@ -1676,8 +1676,8 @@ function summary(name, args) {
   for (const key of ["command", "file_path", "path", "pattern", "query", "url", "subject"]) {
     if (typeof args[key] === "string" && args[key]) return `${name}: ${sanitize(args[key])}`.slice(0, 160);
   }
-  const parts = Object.keys(args).slice(0, 3).map((k) => secret.test(k) ? `${k}=[REDACTED]` : typeof args[k] === "string" ? `${k}=${sanitize(args[k])}` : k);
-  return `${name}${parts.length ? `: ${parts.join(" ")}` : ""}`.slice(0, 160);
+  const parts2 = Object.keys(args).slice(0, 3).map((k) => secret.test(k) ? `${k}=[REDACTED]` : typeof args[k] === "string" ? `${k}=${sanitize(args[k])}` : k);
+  return `${name}${parts2.length ? `: ${parts2.join(" ")}` : ""}`.slice(0, 160);
 }
 function sanitize(value) {
   const secretValue = `(?:"[^"]*"|'[^']*'|[^\\s,'"]+)`;
@@ -3111,14 +3111,14 @@ function publicationSummary(outcome) {
   const closed = linked.filter((r) => r.lifecycle?.closed);
   const failed2 = records.filter((r) => r.state === "failed" || r.state === "reconciling");
   const skipped = records.filter((r) => r.state === "skipped");
-  const parts = [];
-  if (linked.length) parts.push(`Hoja: ${linked.map((r) => `${r.identifier} for task #${r.taskId}`).join(", ")}`);
-  if (closed.length) parts.push(`Hoja closed ${closed.map((r) => r.identifier).join(", ")}`);
-  if (failed2.length) parts.push(`Hoja not confirmed for task(s) ${failed2.map((r) => `#${r.taskId}`).join(", ")}`);
-  if (skipped.length) parts.push(`Hoja skipped task(s) ${skipped.map((r) => `#${r.taskId} (${r.reason})`).join(", ")}`);
+  const parts2 = [];
+  if (linked.length) parts2.push(`Hoja: ${linked.map((r) => `${r.identifier} for task #${r.taskId}`).join(", ")}`);
+  if (closed.length) parts2.push(`Hoja closed ${closed.map((r) => r.identifier).join(", ")}`);
+  if (failed2.length) parts2.push(`Hoja not confirmed for task(s) ${failed2.map((r) => `#${r.taskId}`).join(", ")}`);
+  if (skipped.length) parts2.push(`Hoja skipped task(s) ${skipped.map((r) => `#${r.taskId} (${r.reason})`).join(", ")}`);
   const unresolved = outcome.blocked.filter((r) => !records.some((c) => c.taskId === r.taskId && c.state === "linked"));
-  if (unresolved.length) parts.push(`Hoja unresolved for task(s) ${unresolved.map((r) => `#${r.taskId} (${r.reason ?? r.state})`).join(", ")}`);
-  return parts.length ? parts.join("; ") : void 0;
+  if (unresolved.length) parts2.push(`Hoja unresolved for task(s) ${unresolved.map((r) => `#${r.taskId} (${r.reason ?? r.state})`).join(", ")}`);
+  return parts2.length ? parts2.join("; ") : void 0;
 }
 var REASON_GUIDANCE = {
   no_project: 'no Hoja project is configured for this repository, so nothing was created. Add .pi/config/hoja.json with {"project":"<exact name>"} so every chat in this checkout files there, or call hoja_project action=list, then ask_user_question where to file the work; offer to create a project if none matches. Use hoja_project action=select or action=create for the user-chosen destination, then retry this task with metadata.hojaProject. The work is not blocked: bounded discovery already ran and its note lists the existing projects.',
@@ -3631,16 +3631,16 @@ function registerHojaMode(pi, client = new HojaClient(), options = {}) {
       records = outcome.applied;
       const summary2 = publicationSummary(outcome);
       if (summary2) ctx?.ui?.notify?.(summary2, outcome.records.every((r) => r.state === "linked") && !outcome.blocked.length ? "info" : "warning");
-      const parts = [publicationNote(outcome) ?? ""];
+      const parts2 = [publicationNote(outcome) ?? ""];
       if (overflow > previousOverflow)
-        parts.push(`Hoja recovery: the queue holds ${MAX_PENDING_TASKS} unfiled task(s) and ${overflow} more are not queued. Each is re-queued from its authoritative task on its next successful update; none is treated as filed.`);
+        parts2.push(`Hoja recovery: the queue holds ${MAX_PENDING_TASKS} unfiled task(s) and ${overflow} more are not queued. Each is re-queued from its authoritative task on its next successful update; none is treated as filed.`);
       const fresh = unresolved.filter((record2) => !recovery.reported.includes(record2.taskId));
       if (discovery && fresh.length) {
-        parts.push(recoveryNote(discovery, fresh.map((record2) => record2.taskId)));
+        parts2.push(recoveryNote(discovery, fresh.map((record2) => record2.taskId)));
         recovery = { ...recovery, reported: [...recovery.reported, ...fresh.map((record2) => record2.taskId)] };
         pi.appendEntry?.(HOJA_RECOVERY_ENTRY, recovery);
       }
-      const note = parts.filter(Boolean).join("\n");
+      const note = parts2.filter(Boolean).join("\n");
       if (!note) return void 0;
       const content = Array.isArray(event.content) ? event.content : typeof event.content === "string" ? [{ type: "text", text: event.content }] : [];
       return { content: [...content, { type: "text", text: note }] };
@@ -3718,12 +3718,12 @@ function parseAgyTranscript(text3) {
       pending = [];
       out.push({ role: "user", content: [{ type: "text", text: agyUserRequest(e.content) }] });
     } else if (e?.type === "PLANNER_RESPONSE") {
-      const parts = [];
-      if (typeof e.content === "string" && e.content) parts.push({ type: "text", text: e.content });
+      const parts2 = [];
+      if (typeof e.content === "string" && e.content) parts2.push({ type: "text", text: e.content });
       const calls = Array.isArray(e.tool_calls) ? e.tool_calls : [];
       pending = calls.map((call, i) => ({ id: `agy-${e.step_index}-${i}`, name: agyToolName(call) }));
-      for (const p of pending) parts.push({ type: "toolCall", id: p.id, name: p.name });
-      out.push({ role: "assistant", content: parts, stopReason: calls.length ? "toolUse" : "stop" });
+      for (const p of pending) parts2.push({ type: "toolCall", id: p.id, name: p.name });
+      out.push({ role: "assistant", content: parts2, stopReason: calls.length ? "toolUse" : "stop" });
     } else if (e?.type === "GENERIC" && pending.length) {
       const call = pending.shift();
       let body = agyResultText(typeof e.content === "string" ? e.content : "");
@@ -3774,10 +3774,10 @@ function parseCodexRollout(text3) {
           openAssistant().content.push(...rolloutText(item.content));
         } else a.content.push(...rolloutText(item.content));
       } else if (item.role === "user") {
-        const parts = rolloutText(item.content).filter((p) => p.type === "text" && !ROLLOUT_INJECTED.test(p.text));
-        if (parts.length) {
+        const parts2 = rolloutText(item.content).filter((p) => p.type === "text" && !ROLLOUT_INJECTED.test(p.text));
+        if (parts2.length) {
           assistant = void 0;
-          out.push({ role: "user", content: parts });
+          out.push({ role: "user", content: parts2 });
         }
       }
       continue;
@@ -3793,8 +3793,8 @@ function parseCodexRollout(text3) {
     }
     if ((item.type === "function_call_output" || item.type === "custom_tool_call_output") && typeof item.call_id === "string") {
       assistant = void 0;
-      const { parts, isError } = rolloutOutput(item.output);
-      out.push({ role: "toolResult", toolCallId: item.call_id, toolName: names.get(item.call_id) ?? "tool", content: parts, isError });
+      const { parts: parts2, isError } = rolloutOutput(item.output);
+      out.push({ role: "toolResult", toolCallId: item.call_id, toolName: names.get(item.call_id) ?? "tool", content: parts2, isError });
     }
   }
   return out;
@@ -3814,21 +3814,21 @@ function parseClaudeTranscript(text3) {
     const message = entry?.message;
     if (!message || typeof message !== "object") continue;
     if (entry.type === "assistant" && message.role === "assistant") {
-      const parts = [];
+      const parts2 = [];
       for (const block of Array.isArray(message.content) ? message.content : []) {
-        if (block?.type === "text" && typeof block.text === "string") parts.push({ type: "text", text: block.text });
+        if (block?.type === "text" && typeof block.text === "string") parts2.push({ type: "text", text: block.text });
         else if (block?.type === "tool_use" && typeof block.id === "string") {
           const name = canonicalToolName(String(block.name ?? ""));
           names.set(block.id, name);
-          parts.push({ type: "toolCall", id: block.id, name });
+          parts2.push({ type: "toolCall", id: block.id, name });
         }
       }
       const stopReason = typeof message.stop_reason === "string" ? STOP[message.stop_reason] ?? message.stop_reason : void 0;
       const previous = out.at(-1);
       if (previous?.role === "assistant" && message.id && message.id === lastAssistantId) {
-        previous.content.push(...parts);
+        previous.content.push(...parts2);
         if (stopReason) previous.stopReason = stopReason;
-      } else out.push({ role: "assistant", content: parts, ...stopReason ? { stopReason } : {} });
+      } else out.push({ role: "assistant", content: parts2, ...stopReason ? { stopReason } : {} });
       lastAssistantId = message.id;
       continue;
     }
@@ -4830,16 +4830,16 @@ var AutogenLifecycleHook = class {
     } else this.itersSinceSkill++;
     this.hadRecentError = false;
     const iters = this.itersSinceSkill;
-    const parts = [];
+    const parts2 = [];
     if (iters > this.trigger.nudgeInterval && iters > this.lastNudgeAt) {
-      parts.push(`[SKILL REVIEW] You've made ${iters} tool calls since the last skill review. Preserve useful learning without creating one-session clutter: first patch a loaded skill, then an existing class-level umbrella, then add a support file. Create a new class-level skill only if none fits. If there is genuinely nothing reusable, call SkillManage(action: "review", review_reason: "nothing reusable to save") so work can continue without manufacturing a skill.`);
+      parts2.push(`[SKILL REVIEW] You've made ${iters} tool calls since the last skill review. Preserve useful learning without creating one-session clutter: first patch a loaded skill, then an existing class-level umbrella, then add a support file. Create a new class-level skill only if none fits. If there is genuinely nothing reusable, call SkillManage(action: "review", review_reason: "nothing reusable to save") so work can continue without manufacturing a skill.`);
       this.itersSinceSkill = 0;
       this.lastNudgeAt = 0;
     }
-    if (parts.length === 0) return CONTINUE;
+    if (parts2.length === 0) return CONTINUE;
     const [seq, ok] = budget.tryClaim(session, META_NUDGE_SKILL_REVIEW);
     if (!ok) return CONTINUE;
-    return { message: wrapReminder(this.name, "review", seq, parts.join("\n\n")) };
+    return { message: wrapReminder(this.name, "review", seq, parts2.join("\n\n")) };
   }
 };
 var AutogenBudgetEnforcementHook = class {
@@ -4899,10 +4899,10 @@ If you don't know which skill fits, inspect with SkillManage(action:"list"). If 
   }
 };
 var blockedByHookText = (toolName2, reason) => `Tool '${toolName2}' blocked by hook: ${reason}`;
-function dedupeByLeadingLine(parts) {
+function dedupeByLeadingLine(parts2) {
   const seen = /* @__PURE__ */ new Set();
   const out = [];
-  for (const p of parts) {
+  for (const p of parts2) {
     const head = p.split("\n", 1)[0];
     if (seen.has(head)) continue;
     seen.add(head);
@@ -5018,50 +5018,50 @@ var SwarmHookPipeline = class {
    */
   onUserPrompt(options = {}) {
     if (options.messageAfterReceive !== false) this.budget.recordUserTurn(this.session);
-    const parts = [];
+    const parts2 = [];
     const nudge = this.taskNudge.checkTurn(this.session, options.prompt ?? "", this.options.tasks(), this.budget);
-    if (nudge) parts.push(nudge);
+    if (nudge) parts2.push(nudge);
     let pending = this.pendingToolMessages.splice(0);
     if (pending.length > 3) pending = pending.slice(pending.length - 3);
-    const injected = dedupeByLeadingLine([...parts, ...pending]);
+    const injected = dedupeByLeadingLine([...parts2, ...pending]);
     return { injected: injected.join("\n") };
   }
   preTool(event) {
     const tasks = this.options.tasks();
-    const parts = [];
+    const parts2 = [];
     for (const hook of this.options.preHooks) {
       const result = hook.run(event, tasks, this.budget, this.session);
       if (result.block) return { block: blockedByHookText(event.toolName, result.message ?? ""), context: "" };
       if (result.message) {
         const wrapped = formatHookContext(hook.name, result.message);
         if (wrapped) {
-          parts.push(wrapped);
+          parts2.push(wrapped);
           this.pendingToolMessages.push(result.message);
         }
       }
     }
-    return { context: parts.join("\n\n") };
+    return { context: parts2.join("\n\n") };
   }
   /** Returns the post-context for this call and remembers it for the turn message. */
   postTool(event) {
     const tasks = this.options.tasks();
     this.taskNudge.recordToolCall(this.session);
-    const parts = [];
+    const parts2 = [];
     for (const hook of this.options.postHooks) {
       const result = hook.run(event, tasks, this.budget, this.session);
       if (result.message) {
         const wrapped = formatHookContext(hook.name, result.message);
-        if (wrapped) parts.push(wrapped);
+        if (wrapped) parts2.push(wrapped);
       }
     }
-    const context2 = parts.join("\n\n");
+    const context2 = parts2.join("\n\n");
     if (context2) this.turnParts.push(context2);
     return context2;
   }
   /** agent_tools.go: one RoleUser message per assistant tool batch. */
   flushTurn() {
-    const parts = this.turnParts.splice(0);
-    return parts.join("\n\n");
+    const parts2 = this.turnParts.splice(0);
+    return parts2.join("\n\n");
   }
   /** agent_tools.go: prefix pre-context onto a successful result. */
   static applyPreContext(context2, output) {
@@ -7382,6 +7382,98 @@ function taskBoard(manager, width = 100) {
 // src/generated/contract.ts
 var TASK_COMPLETION_CONTRACT = "<task_completion_contract>Read each task's questions before implementation and treat them as explicit acceptance obligations. A successful code edit or test is not a successful TaskManage completion. To complete a question-bearing task, supply answers:[{question:QUESTION_ID,answer:TRUTHFUL_ANSWER,evidence:EVIDENCE_REFERENCE}] for missing or changed answers; saved answers for unchanged questions are reused and all evidence is revalidated at completion. Evidence must use a real workspace reference (file#Heading or file#Lx-Ly) or a live tool-result reference (tool:<ToolName> or tool:<ToolName>#<n>, 1-based chronological result of that tool in this session) when the evidence is a tool call/output rather than a file. If TaskManage rejects completion, acknowledge the failure, read the current task and exact error, and change the missing/invalid input before retrying. Never repeat an unchanged rejected completion, delete questions to bypass validation, or invent evidence. If an answer cannot be established, keep the task unfinished with a blocker and clearly distinguish implemented changes from verified completion in your final response. Use ask_user_question only for decisions requiring the user, not questions you can answer by inspecting or testing.</task_completion_contract>";
 
+// src/update-check.ts
+import { existsSync as existsSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync9, writeFileSync as writeFileSync4 } from "node:fs";
+import { dirname as dirname4, join as join8, resolve as resolve4 } from "node:path";
+import { fileURLToPath } from "node:url";
+var REPOS = {
+  claude: "hoja-work/hoja-claude-plugin",
+  codex: "hoja-work/hoja-codex-plugin",
+  antigravity: "hoja-work/hoja-antigravity-plugin"
+};
+var HOST_NAMES = { claude: "Claude Code", codex: "Codex", antigravity: "Antigravity" };
+var CHECK_INTERVAL_MS = 24 * 60 * 6e4;
+var RETRY_AFTER_FAILURE_MS = 6 * 60 * 6e4;
+var FETCH_TIMEOUT_MS = 1500;
+var pluginRoot = () => resolve4(dirname4(fileURLToPath(import.meta.url)), "..");
+function installedVersion(root) {
+  try {
+    const version = JSON.parse(readFileSync9(join8(root, "package.json"), "utf8"))?.version;
+    return typeof version === "string" ? version : void 0;
+  } catch {
+    return void 0;
+  }
+}
+var parts = (version) => {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  return match ? match.slice(1, 4).map(Number) : void 0;
+};
+function isNewer(candidate, current) {
+  const a = candidate ? parts(candidate) : void 0;
+  const b = current ? parts(current) : void 0;
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return false;
+}
+function readCache(file) {
+  try {
+    return JSON.parse(readFileSync9(file, "utf8"));
+  } catch {
+    return void 0;
+  }
+}
+function writeCache(file, cache) {
+  try {
+    mkdirSync7(dirname4(file), { recursive: true });
+    writeFileSync4(file, JSON.stringify(cache) + "\n");
+  } catch {
+  }
+}
+async function latestVersion(repo, cacheFile, now, fetchImpl) {
+  const cached = readCache(cacheFile);
+  if (cached?.repo === repo) {
+    const age = now - Date.parse(cached.checkedAt);
+    if (age >= 0 && age < (cached.ok ? CHECK_INTERVAL_MS : RETRY_AFTER_FAILURE_MS)) return cached.latest;
+  }
+  let latest;
+  try {
+    const response = await fetchImpl(`https://raw.githubusercontent.com/${repo}/main/package.json`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      headers: { accept: "application/json" }
+    });
+    const version = response.ok ? (await response.json())?.version : void 0;
+    if (typeof version === "string" && parts(version)) latest = version;
+  } catch {
+  }
+  const keep = cached?.repo === repo ? cached.latest : void 0;
+  writeCache(cacheFile, { repo, checkedAt: new Date(now).toISOString(), ok: !!latest, ...latest ?? keep ? { latest: latest ?? keep } : {} });
+  return latest ?? keep;
+}
+function updateCommand(host, root) {
+  if (host === "codex") return "codex plugin marketplace upgrade && codex plugin add hoja@hoja";
+  if (host === "antigravity")
+    return existsSync7(join8(root, ".git")) ? `git -C ${JSON.stringify(root)} pull --ff-only` : `git clone --depth 1 https://github.com/${REPOS.antigravity} hoja-antigravity-plugin && agy plugin install ./hoja-antigravity-plugin`;
+  return "claude plugin update hoja@hoja";
+}
+async function updateNotice(deps = {}) {
+  const env = deps.env ?? process.env;
+  if (/^(0|false|off|no)$/i.test(env.HOJA_PLUGIN_UPDATE_CHECK?.trim() ?? "")) return void 0;
+  try {
+    const host = hostOf(env);
+    const root = deps.root ?? pluginRoot();
+    const current = installedVersion(root);
+    if (!current) return void 0;
+    const fetchImpl = deps.fetch ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") return void 0;
+    const latest = await latestVersion(REPOS[host], deps.cacheFile ?? join8(dataDir(env), "update-check.json"), (deps.now ?? Date.now)(), fetchImpl);
+    if (!isNewer(latest, current)) return void 0;
+    const tail = host === "claude" ? " To get updates automatically, turn on auto-update for the hoja marketplace in /plugin." : "";
+    return `Hoja plugin ${latest} is available (installed: ${current}). Update with \`${updateCommand(host, root)}\`, then restart ${HOST_NAMES[host]}.${tail}`;
+  } catch {
+    return void 0;
+  }
+}
+
 // src/session-start.ts
 async function sessionContext(input2, env = process.env) {
   const { shim } = createRuntime({ dataDir: dataDir(env), cwd: input2.cwd || process.cwd(), hoja: !/^(1|true)$/i.test(env.HOJA_PLUGIN_DISABLE_HOJA ?? "") });
@@ -7401,12 +7493,12 @@ async function main2() {
   applyCredentials();
   let input2 = {};
   try {
-    input2 = JSON.parse(readFileSync9(0, "utf8") || "{}");
+    input2 = JSON.parse(readFileSync10(0, "utf8") || "{}");
   } catch {
   }
   new TraceRecorder({ dataDir: dataDir(), detail: traceDetail() }).record(input2.session_id, "SessionStart", input2);
-  const additionalContext = await sessionContext(input2);
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext } }));
+  const [additionalContext, notice] = await Promise.all([sessionContext(input2), updateNotice()]);
+  process.stdout.write(JSON.stringify({ ...notice ? { systemMessage: notice } : {}, hookSpecificOutput: { hookEventName: "SessionStart", additionalContext } }));
 }
 if (process.argv[1] && /session-start\.(m?js|ts)$/.test(process.argv[1])) main2().catch((error) => {
   process.stderr.write(String(error?.stack ?? error));
@@ -7422,11 +7514,19 @@ var debug = (line) => {
   } catch {
   }
 };
-async function handleAgyHook(event, payload, env = process.env) {
+async function handleAgyHook(event, payload, env = process.env, update = {}) {
   if (event === "SessionStart") {
     const base = agyBase(payload);
     new TraceRecorder({ dataDir: dataDir(env), detail: traceDetail(env) }).record(base.session_id, "SessionStart", { ...base, source: "startup" });
-    const text3 = await sessionContext({ session_id: base.session_id, transcript_path: base.transcript_path, cwd: base.cwd }, env);
+    const [context2, notice] = await Promise.all([
+      sessionContext({ session_id: base.session_id, transcript_path: base.transcript_path, cwd: base.cwd }, env),
+      updateNotice({ env, ...update })
+    ]);
+    const relay = notice ? `<hoja_plugin_update>
+${notice}
+Tell the user this once, in one sentence, at the start of your first reply.
+</hoja_plugin_update>` : "";
+    const text3 = [context2, relay].filter(Boolean).join("\n");
     return text3 ? { injectSteps: [{ systemMessage: { systemMessage: text3 } }] } : {};
   }
   const socket = findSocket(env);
@@ -7451,7 +7551,7 @@ async function main3() {
   const event = process.argv[2] ?? "";
   let payload = {};
   try {
-    payload = JSON.parse(readFileSync10(0, "utf8") || "{}");
+    payload = JSON.parse(readFileSync11(0, "utf8") || "{}");
   } catch {
   }
   if (event === "SessionStart") applyCredentials();

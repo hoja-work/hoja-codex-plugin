@@ -12,6 +12,7 @@ import { agyBase, agyToBridge, bridgeToAgy, failOpen } from "./agy.ts";
 import { findSocket, request } from "./agy-socket.ts";
 import { applyCredentials, dataDir, traceDetail } from "./env.ts";
 import { sessionContext } from "./session-start.ts";
+import { updateNotice, type UpdateDeps } from "./update-check.ts";
 import { TraceRecorder } from "./trace/recorder.ts";
 
 const debug = (line: string) => {
@@ -19,11 +20,17 @@ const debug = (line: string) => {
 	if (log) try { appendFileSync(log, `${new Date().toISOString()} [agy-hook] ${line}\n`); } catch { /* best effort */ }
 };
 
-export async function handleAgyHook(event: string, payload: Record<string, any>, env: NodeJS.ProcessEnv = process.env): Promise<Record<string, unknown>> {
+export async function handleAgyHook(event: string, payload: Record<string, any>, env: NodeJS.ProcessEnv = process.env, update: UpdateDeps = {}): Promise<Record<string, unknown>> {
 	if (event === "SessionStart") {
 		const base = agyBase(payload);
 		new TraceRecorder({ dataDir: dataDir(env), detail: traceDetail(env) }).record(base.session_id, "SessionStart", { ...base, source: "startup" });
-		const text = await sessionContext({ session_id: base.session_id, transcript_path: base.transcript_path, cwd: base.cwd }, env);
+		const [context, notice] = await Promise.all([
+			sessionContext({ session_id: base.session_id, transcript_path: base.transcript_path, cwd: base.cwd }, env),
+			updateNotice({ env, ...update }),
+		]);
+		// Antigravity shows hook output only to the model, so the agent is asked to relay the notice once.
+		const relay = notice ? `<hoja_plugin_update>\n${notice}\nTell the user this once, in one sentence, at the start of your first reply.\n</hoja_plugin_update>` : "";
+		const text = [context, relay].filter(Boolean).join("\n");
 		return text ? { injectSteps: [{ systemMessage: { systemMessage: text } }] } : {};
 	}
 	const socket = findSocket(env);
