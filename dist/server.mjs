@@ -3559,9 +3559,348 @@ var TranscriptReader = class {
 };
 
 // src/pi-shim.ts
+import { appendFileSync as appendFileSync2, existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync6 } from "node:fs";
+import { join as join4 } from "node:path";
+
+// src/trace/touched.ts
+import { existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join3 } from "node:path";
+
+// src/trace/recorder.ts
 import { appendFileSync, existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync4 } from "node:fs";
 import { join as join2 } from "node:path";
+
+// src/trace/redact.ts
+var PATTERNS = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  /\bsk-ant-[A-Za-z0-9_-]{16,}/g,
+  /\bsk-[A-Za-z0-9_-]{20,}/g,
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+  /\b(?:hoja|lin)_(?:api|oauth)_[A-Za-z0-9]{16,}/g
+];
+var ASSIGNMENTS = /((?:authorization|bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|client[_-]?secret)["']?\s*[:=]\s*["']?(?:bearer\s+)?)([^\s"',;&]{8,})/gi;
+var SECRET_ENV = /(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL)/i;
+var Redactor = class {
+  literals;
+  constructor(env = process.env) {
+    this.literals = Object.entries(env).filter(([name, value]) => SECRET_ENV.test(name) && typeof value === "string" && value.trim().length >= 8).map(([, value]) => value.trim()).sort((a, b) => b.length - a.length);
+  }
+  scrub(text3) {
+    let out = text3;
+    for (const literal of this.literals) if (out.includes(literal)) out = out.split(literal).join("[redacted]");
+    for (const pattern of PATTERNS) out = out.replace(pattern, "[redacted]");
+    return out.replace(ASSIGNMENTS, "$1[redacted]");
+  }
+};
+var FIELD_CAP = 256e3;
+function clipMiddle(text3, max) {
+  if (text3.length <= max) return text3;
+  const head = Math.ceil(max * 0.6), tail = max - head;
+  const omitted = text3.length - head - tail;
+  return `${text3.slice(0, head).replace(/[\uD800-\uDBFF]$/, "")}
+\u2026 [${omitted} chars omitted] \u2026
+${text3.slice(text3.length - tail).replace(/^[\uDC00-\uDFFF]/, "")}`;
+}
+function clip2(text3, max, counted = true) {
+  if (text3.length <= max) return text3;
+  const head = text3.slice(0, max).replace(/[\uD800-\uDBFF]$/, "");
+  return counted ? `${head}\u2026 [+${text3.length - head.length} chars]` : `${head.trimEnd()}\u2026`;
+}
+function taskOps(ops) {
+  return ops.map((op) => op?.op === "create" ? `create ${op.subject ?? ""}`.trim() : op?.op === "update" ? `#${op.taskId ?? "?"}${op.status ? ` \u2192 ${op.status}` : op.active ? " focus" : " update"}` : String(op?.op ?? "")).filter(Boolean).join(", ");
+}
+function inputPreview(tool, input2) {
+  if (input2 == null) return "";
+  if (typeof input2 === "string") return input2;
+  const i = input2;
+  const pick = (...keys) => keys.map((k) => i[k]).find((v) => typeof v === "string" && v);
+  const lead = tool === "Bash" ? pick("command") : /^(Read|Write|Edit|MultiEdit|NotebookEdit)$/.test(tool) ? pick("file_path", "notebook_path") : /^(Grep|Glob)$/.test(tool) ? [pick("pattern"), pick("path")].filter(Boolean).join("  in ") : /^(WebFetch|WebSearch)$/.test(tool) ? pick("url", "query") : tool === "Agent" || tool === "Task" ? pick("description", "prompt") : tool === "TaskManage" && Array.isArray(i.operations) ? taskOps(i.operations) : pick("action", "query", "identifier", "issue", "subject", "description", "url", "name", "command", "path");
+  if (lead) return lead;
+  const pairs = Object.entries(i).filter(([, v]) => v !== null && ["string", "number", "boolean"].includes(typeof v)).map(([k, v]) => `${k}=${typeof v === "string" ? JSON.stringify(v) : v}`);
+  if (pairs.length) return pairs.join(" ");
+  try {
+    return JSON.stringify(input2);
+  } catch {
+    return String(input2);
+  }
+}
+function toolLabel(tool, input2) {
+  const preview = inputPreview(tool, input2).split("\n")[0];
+  return preview && preview !== "{}" ? `${tool} \xB7 ${clip2(preview, 100, false)}` : tool;
+}
+
+// src/trace/recorder.ts
 var SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/;
+var tracesDir = (dataDir2) => join2(dataDir2, "traces");
+var eventsPath = (dataDir2, sessionId) => join2(tracesDir(dataDir2), `${SAFE_ID.test(sessionId) ? sessionId : "invalid-session"}.events.jsonl`);
+var tracePath = (dataDir2, sessionId) => join2(tracesDir(dataDir2), `${SAFE_ID.test(sessionId) ? sessionId : "invalid-session"}.trace.json`);
+var num = (v) => {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : void 0;
+};
+var str = (v) => typeof v === "string" && v ? v : void 0;
+var TraceRecorder = class {
+  constructor(options) {
+    this.options = options;
+    this.redactor = options.redactor ?? new Redactor();
+    this.full = (options.detail ?? "full") === "full";
+  }
+  options;
+  redactor;
+  full;
+  lastTranscript;
+  text(value, max) {
+    if (!this.full) return void 0;
+    const s = typeof value === "string" ? value : value == null ? "" : (() => {
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    })();
+    return s ? clip2(this.redactor.scrub(s), max) : void 0;
+  }
+  /** Whole content (scrubbed), for hooks-only traces: prompts, tool inputs, outputs and errors. */
+  content(value) {
+    if (!this.full) return void 0;
+    const s = typeof value === "string" ? value : value == null ? "" : (() => {
+      try {
+        return JSON.stringify(value, null, 1);
+      } catch {
+        return String(value);
+      }
+    })();
+    return s ? clipMiddle(this.redactor.scrub(s), FIELD_CAP) : void 0;
+  }
+  /** Shape one hook payload (already placeholder-filtered by the bridge) plus the bridge's own decision. */
+  shape(event, payload, output = {}, outputText) {
+    const at = (this.options.now?.() ?? /* @__PURE__ */ new Date()).toISOString();
+    const tool = str(payload.tool_name);
+    const hso = output?.hookSpecificOutput ?? {};
+    const record2 = {
+      at,
+      event,
+      agentId: str(payload.agent_id),
+      agentType: str(payload.agent_type),
+      tool,
+      toolUseId: str(payload.tool_use_id),
+      durationMs: num(payload.duration_ms),
+      permissionMode: str(payload.permission_mode),
+      model: typeof payload.model === "string" ? payload.model : str(payload.model?.id),
+      stepIdx: num(payload.step_idx),
+      invocationNum: num(payload.invocation_num)
+    };
+    if (event === "PreToolUse") {
+      if (hso.permissionDecision === "deny") {
+        record2.decision = "deny";
+        record2.reason = this.content(hso.permissionDecisionReason) ?? "blocked";
+      } else if (hso.additionalContext) record2.context = this.content(hso.additionalContext);
+      record2.label = this.text(inputPreview(tool ?? "", payload.tool_input).split("\n")[0], 200);
+      record2.input = this.content(payload.tool_input && typeof payload.tool_input === "object" && !Object.keys(payload.tool_input).length ? "" : tool === "Bash" ? inputPreview(tool, payload.tool_input) : payload.tool_input);
+    }
+    if (event === "PostToolUse") {
+      record2.output = this.content(outputText);
+      const touched = tool ? extractTouchedIssuesFromTool(tool, payload.tool_input, outputText) : [];
+      if (touched.length) record2.touchedIssues = touched;
+    }
+    if (event === "PostToolUseFailure") {
+      record2.error = this.content(outputText ?? payload.error) ?? "failed";
+      if (payload.is_interrupt === true || payload.is_interrupt === "true") record2.interrupted = true;
+    }
+    if (event === "UserPromptSubmit") record2.prompt = this.content(payload.prompt);
+    if (event === "SessionStart") record2.source = str(payload.source);
+    const transcript = str(payload.transcript_path);
+    if (transcript && !payload.agent_id && this.lastTranscript !== transcript) {
+      record2.transcriptPath = transcript;
+      this.lastTranscript = transcript;
+    }
+    if (event === "SessionEnd") record2.reason = str(payload.reason);
+    if (event === "PreCompact" || event === "PostCompact") record2.trigger = str(payload.trigger);
+    if (event === "Notification") {
+      record2.message = this.text(payload.message, 300);
+      record2.notificationType = str(payload.notification_type);
+    }
+    if (event === "StopFailure") record2.error = this.content(payload.error) ?? "turn failed";
+    if (event === "PermissionDenied") record2.reason = this.text(payload.reason, 300);
+    if (event === "SubagentStop") record2.agentTranscriptPath = str(payload.agent_transcript_path);
+    return Object.fromEntries(Object.entries(record2).filter(([, v]) => v !== void 0));
+  }
+  record(sessionId, event, payload, output, outputText) {
+    if (!sessionId) return;
+    try {
+      const shaped = this.shape(event, payload, output, outputText);
+      if (shaped.touchedIssues?.length) appendTouchedIssues(this.options.dataDir, sessionId, shaped.touchedIssues);
+      const line = JSON.stringify(shaped);
+      mkdirSync2(tracesDir(this.options.dataDir), { recursive: true, mode: 448 });
+      appendFileSync(eventsPath(this.options.dataDir, sessionId), line + "\n", { mode: 384 });
+    } catch (error) {
+      this.options.log?.(`trace record failed: ${error.message}`);
+    }
+  }
+};
+function readHookRecords(dataDir2, sessionId) {
+  const path = eventsPath(dataDir2, sessionId);
+  if (!existsSync2(path)) return [];
+  return readFileSync4(path, "utf8").split("\n").flatMap((line) => {
+    try {
+      return line.trim() ? [JSON.parse(line)] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+// src/trace/touched.ts
+var SAFE_ID2 = /^[A-Za-z0-9._-]{1,128}$/;
+var ISSUE_RE = /\b([A-Z][A-Z0-9]{1,9}-\d+(?:-[A-Za-z]-\d+)*)\b/g;
+var HOJA_WRITE_OPS = /* @__PURE__ */ new Set([
+  "hoja_issueCreate",
+  "hoja_taskCreate",
+  "hoja_issueUpdate",
+  "hoja_taskUpdate",
+  "hoja_issueMove",
+  "hoja_issueArchive",
+  "hoja_issueDelete",
+  "hoja_issueSubscribe",
+  "hoja_issueUnsubscribe",
+  "hoja_commentCreate",
+  "hoja_commentUpdate",
+  "hoja_commentDelete",
+  "hoja_issueDecisionCreate",
+  "hoja_taskDecisionCreate",
+  "hoja_issueDecisionAnswer",
+  "hoja_taskDecisionAnswer",
+  "hoja_issueDecisionCancel",
+  "hoja_taskDecisionCancel",
+  "hoja_issueReviewRequest",
+  "hoja_taskReviewRequest",
+  "hoja_attachmentCreate",
+  "hoja_githubLinkAdd"
+]);
+var BASH_HOJA_WRITE = /\bhoja\s+(?:issue|task|comment|decision)\s+(?:create|update|comment|edit|close|reopen|archive|move|assign|answer|ask)\b/i;
+function safePath(dir, file) {
+  mkdirSync3(dir, { recursive: true, mode: 448 });
+  return join3(dir, file);
+}
+function writeAtomic(path, value) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync2(tmp, JSON.stringify(value), { mode: 384 });
+  renameSync(tmp, path);
+}
+function recordActiveSession(dataDir2, sessionId, ppid = process.ppid) {
+  if (!dataDir2 || !SAFE_ID2.test(sessionId)) return;
+  try {
+    const dir = tracesDir(dataDir2);
+    const payload = { sessionId, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    if (ppid > 1) writeAtomic(safePath(dir, `.active-${ppid}.json`), payload);
+    writeAtomic(safePath(dir, ".active.json"), payload);
+  } catch {
+  }
+}
+function readActiveSession(dataDir2, ppid = process.ppid, maxAgeMs = 24 * 60 * 60 * 1e3) {
+  if (!dataDir2) return void 0;
+  const dir = tracesDir(dataDir2);
+  for (const name of [...ppid > 1 ? [`.active-${ppid}.json`] : [], ".active.json"]) {
+    const file = join3(dir, name);
+    if (!existsSync3(file)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync5(file, "utf8"));
+      const sid = typeof parsed?.sessionId === "string" ? parsed.sessionId : "";
+      const age = Date.now() - Date.parse(String(parsed?.updatedAt ?? ""));
+      if (SAFE_ID2.test(sid) && (!Number.isFinite(age) || age <= maxAgeMs)) return sid;
+    } catch {
+    }
+  }
+  return void 0;
+}
+function isHojaWriteTool(rawTool, params) {
+  const canonical = canonicalToolName(rawTool);
+  const mcp = /^mcp__(?:plugin_[^_]+_)?[^_]+__(.+)$/.exec(canonical);
+  const op = mcp ? mcp[1] : canonical;
+  if (HOJA_WRITE_OPS.has(op)) return { isWrite: true, op };
+  if (canonical === "Bash") {
+    const cmd = typeof params?.command === "string" ? params.command : "";
+    if (BASH_HOJA_WRITE.test(cmd)) return { isWrite: true, op: "Bash" };
+  }
+  return { isWrite: false, op };
+}
+function collectIdentifiers(value, out, depth = 0) {
+  if (depth > 5 || value == null) return;
+  if (typeof value === "string") {
+    for (const m of value.matchAll(ISSUE_RE)) out.add(m[1]);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectIdentifiers(item, out, depth + 1);
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "identifier" || k === "issueId" || k === "id" || k === "url" || k === "issue" || k === "task" || k === "comment" || k === "decision" || /^(?:issue|task|comment|decision|attachment|githubLink)[A-Z]/.test(k)) {
+        collectIdentifiers(v, out, depth + 1);
+      }
+    }
+  }
+}
+function extractTouchedIssuesFromTool(rawTool, params, outputText) {
+  const { isWrite, op } = isHojaWriteTool(rawTool, params);
+  if (!isWrite) return [];
+  const found = /* @__PURE__ */ new Set();
+  if (op !== "Bash" && params && typeof params === "object") {
+    const p = params;
+    for (const key of ["issueId", "id", "identifier"]) {
+      if (typeof p[key] === "string") collectIdentifiers(p[key], found);
+    }
+  } else if (op === "Bash" && typeof params?.command === "string") {
+    const cmd = String(params.command);
+    const head = cmd.split(/\s--(?:body|description|title)\b/)[0] ?? cmd;
+    collectIdentifiers(head, found);
+  }
+  if (outputText) {
+    try {
+      const parsed = JSON.parse(outputText);
+      collectIdentifiers(parsed, found);
+    } catch {
+      if (op !== "Bash") collectIdentifiers(outputText, found);
+      else {
+        for (const m of outputText.slice(0, 1e3).matchAll(ISSUE_RE)) found.add(m[1]);
+      }
+    }
+  }
+  return [...found];
+}
+var touchedPath = (dataDir2, sessionId) => join3(tracesDir(dataDir2), `${SAFE_ID2.test(sessionId) ? sessionId : "invalid-session"}.issues.json`);
+function readTouchedIssues(dataDir2, sessionId) {
+  if (!dataDir2 || !SAFE_ID2.test(sessionId)) return [];
+  const path = touchedPath(dataDir2, sessionId);
+  if (!existsSync3(path)) return [];
+  try {
+    const v = JSON.parse(readFileSync5(path, "utf8"));
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string" && !!x) : [];
+  } catch {
+    return [];
+  }
+}
+function appendTouchedIssues(dataDir2, sessionId, issues) {
+  if (!dataDir2 || !SAFE_ID2.test(sessionId) || !issues.length) return [];
+  try {
+    const merged = [.../* @__PURE__ */ new Set([...readTouchedIssues(dataDir2, sessionId), ...issues.filter(Boolean)])];
+    const path = touchedPath(dataDir2, sessionId);
+    mkdirSync3(tracesDir(dataDir2), { recursive: true, mode: 448 });
+    writeAtomic(path, merged);
+    return merged;
+  } catch {
+    return [];
+  }
+}
+
+// src/pi-shim.ts
+var SAFE_ID3 = /^[A-Za-z0-9._-]{1,128}$/;
 var PiShim = class {
   constructor(options) {
     this.options = options;
@@ -3598,15 +3937,15 @@ var PiShim = class {
     }
   };
   journalPath(sessionId) {
-    return join2(this.options.dataDir, "sessions", `${SAFE_ID.test(sessionId) ? sessionId : "invalid-session"}.jsonl`);
+    return join4(this.options.dataDir, "sessions", `${SAFE_ID3.test(sessionId) ? sessionId : "invalid-session"}.jsonl`);
   }
   appendEntry(customType, data) {
     const entry = { type: "custom", customType, data: data === void 0 ? void 0 : structuredClone(data), id: `${Date.now().toString(36)}-${(this.seq++).toString(36)}`, timestamp: (/* @__PURE__ */ new Date()).toISOString() };
     this.entries.push(entry);
     if (!this.sessionId) return;
     try {
-      mkdirSync2(join2(this.options.dataDir, "sessions"), { recursive: true, mode: 448 });
-      appendFileSync(this.journalPath(this.sessionId), JSON.stringify(entry) + "\n", { mode: 384 });
+      mkdirSync4(join4(this.options.dataDir, "sessions"), { recursive: true, mode: 448 });
+      appendFileSync2(this.journalPath(this.sessionId), JSON.stringify(entry) + "\n", { mode: 384 });
     } catch (error) {
       this.options.log?.(`journal write failed: ${error.message}`);
     }
@@ -3674,13 +4013,14 @@ var PiShim = class {
   async bindSession(sessionId, transcriptPath, cwd) {
     if (cwd) this.cwd = cwd;
     this.transcript.setPath(transcriptPath);
+    if (sessionId) recordActiveSession(this.options.dataDir, sessionId);
     if (sessionId === this.sessionId) return false;
     if (this.sessionId) await this.emit("session_shutdown");
     this.sessionId = sessionId;
     this.entries = [];
     const path = this.journalPath(sessionId);
-    if (existsSync2(path)) {
-      for (const line of readFileSync4(path, "utf8").split("\n")) {
+    if (existsSync4(path)) {
+      for (const line of readFileSync6(path, "utf8").split("\n")) {
         if (!line.trim()) continue;
         try {
           this.entries.push(JSON.parse(line));
@@ -5584,8 +5924,9 @@ var HookBridge = class {
     const content = [...this.deferred.splice(0), this.pipeline.flushTurn()].filter(Boolean).join("\n\n");
     return content ? context(hookEventName, content) : {};
   }
-  stop(payload) {
+  async stop(payload) {
     if (this.subagent || process.env.PI_SWARM_SUBAGENT === "1") return {};
+    await this.shim.emit("turn_end");
     const session = this.shim.sessionId || "session";
     const messages = [...this.shim.transcript.messages()];
     const last = messages.at(-1);
@@ -5620,7 +5961,7 @@ import { createInterface } from "node:readline";
 
 // src/env.ts
 import { homedir } from "node:os";
-import { dirname as dirname2, join as join3, resolve as resolve2 } from "node:path";
+import { dirname as dirname2, join as join5, resolve as resolve2 } from "node:path";
 
 // src/credentials.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
@@ -5716,12 +6057,20 @@ var Credentials = class {
     }
   }
 };
-function authFetch(credentials2, base = fetch) {
+function authFetch(credentials2, base = fetch, extraHeaders) {
   const withToken = (init) => {
     const headers = { ...init?.headers ?? {} };
-    for (const key of Object.keys(headers)) if (key.toLowerCase() === "authorization") delete headers[key];
     const token = credentials2.token();
-    if (token) headers.authorization = `Bearer ${token}`;
+    if (token) {
+      for (const key of Object.keys(headers)) if (key.toLowerCase() === "authorization") delete headers[key];
+      headers.authorization = `Bearer ${token}`;
+    }
+    if (!Object.keys(headers).some((k) => k.toLowerCase() === "x-hoja-actor")) headers["x-hoja-actor"] = "agent";
+    if (extraHeaders) {
+      for (const [k, v] of Object.entries(extraHeaders())) {
+        if (v && !Object.keys(headers).some((existing) => existing.toLowerCase() === k.toLowerCase())) headers[k] = v;
+      }
+    }
     return { ...init, headers };
   };
   return async (url, init) => {
@@ -5765,11 +6114,11 @@ function dataDir(env = process.env, script = process.argv[1]) {
   const explicit = env.HOJA_PLUGIN_DATA?.trim() || env.CLAUDE_PLUGIN_DATA?.trim() || env.PLUGIN_DATA?.trim();
   if (explicit) return explicit;
   const host = env.HOJA_PLUGIN_HOST?.trim().toLowerCase();
-  if (host === "antigravity" || host === "agy") return join3(homedir(), ".gemini", "antigravity-cli", "plugin-data", "hoja");
-  if (host !== "codex") return join3(homedir(), ".claude", "plugins", "data", "hoja-standalone");
+  if (host === "antigravity" || host === "agy") return join5(homedir(), ".gemini", "antigravity-cli", "plugin-data", "hoja");
+  if (host !== "codex") return join5(homedir(), ".claude", "plugins", "data", "hoja-standalone");
   const installed = script ? /^(.*)[\\/]plugins[\\/]cache[\\/]([^\\/]+)[\\/]([^\\/]+)[\\/][^\\/]+$/.exec(resolve2(dirname2(resolve2(script)), "..")) : null;
-  if (installed) return join3(installed[1], "plugins", "data", `${installed[3]}-${installed[2]}`);
-  return join3(env.CODEX_HOME?.trim() || join3(homedir(), ".codex"), "plugins", "data", "hoja-standalone");
+  if (installed) return join5(installed[1], "plugins", "data", `${installed[3]}-${installed[2]}`);
+  return join5(env.CODEX_HOME?.trim() || join5(homedir(), ".codex"), "plugins", "data", "hoja-standalone");
 }
 function enforcementMode(env = process.env) {
   const v = (env.HOJA_PLUGIN_ENFORCEMENT || env.HOJA_TASK_ENFORCEMENT || "block").trim();
@@ -5802,14 +6151,16 @@ function resolveMcpUrl(env = process.env) {
   }
 }
 var UpstreamMcp = class {
-  constructor(url, token, fetchImpl = fetch) {
+  constructor(url, token, fetchImpl = fetch, extraHeaders) {
     this.url = url;
     this.token = token;
     this.fetchImpl = fetchImpl;
+    this.extraHeaders = extraHeaders;
   }
   url;
   token;
   fetchImpl;
+  extraHeaders;
   session;
   seq = 0;
   protocolVersion = "2025-06-18";
@@ -5819,8 +6170,14 @@ var UpstreamMcp = class {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       authorization: `Bearer ${this.token}`,
-      "mcp-protocol-version": this.protocolVersion
+      "mcp-protocol-version": this.protocolVersion,
+      "x-hoja-actor": "agent"
     };
+    if (this.extraHeaders) {
+      for (const [k, v] of Object.entries(this.extraHeaders())) {
+        if (v) headers[k] = v;
+      }
+    }
     if (this.session) headers["mcp-session-id"] = this.session;
     const response = await this.fetchImpl(this.url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", ...id ? { id } : {}, method, ...params ? { params } : {} }), signal });
     const session = response.headers.get("mcp-session-id");
@@ -5854,18 +6211,26 @@ function parseMessages(body, contentType) {
   }
   return out;
 }
-function createProxy(env = process.env, fetchImpl, credentials2) {
+function createProxy(env = process.env, fetchImpl, credentials2, pluginDataDir) {
   const url = resolveMcpUrl(env);
   const token = credentials2 ? credentials2.token() : resolveHojaToken(env);
   const configProblem = credentials2?.problems.join(" ") ?? "";
   const problem = configProblem || (!url ? HOJA_ENDPOINT_HINT : !token ? `${MISSING_HOJA_TOKEN}. ${SIGN_IN_HINT}` : "");
-  const transport = credentials2 ? authFetch(credentials2, fetchImpl ?? fetch) : fetchImpl;
-  const upstream = problem ? void 0 : new UpstreamMcp(url, token, transport);
+  const sessionDir = pluginDataDir ?? (env.HOJA_PLUGIN_DATA || env.CLAUDE_PLUGIN_DATA || env.PLUGIN_DATA ? dataDir(env) : "");
+  const host = hostOf(env);
+  const clientName = host === "claude" ? "claude-code" : host;
+  const headerProvider = () => ({
+    "x-hoja-actor": "agent",
+    "x-hoja-client": clientName,
+    ...sessionDir ? { "x-hoja-session-id": readActiveSession(sessionDir) } : {}
+  });
+  const transport = credentials2 ? authFetch(credentials2, fetchImpl ?? fetch, headerProvider) : fetchImpl;
+  const upstream = problem ? void 0 : new UpstreamMcp(url, token, transport, headerProvider);
   let ready;
   let failure = problem;
   const connect = (protocolVersion) => ready ??= (async () => {
     upstream.protocolVersion = protocolVersion;
-    const result = await upstream.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: "hoja-claude-plugin", version: "0.2.0" } });
+    const result = await upstream.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: `hoja-${host}-plugin`, version: "0.2.0" } });
     if (typeof result?.protocolVersion === "string") upstream.protocolVersion = result.protocolVersion;
     await upstream.send("notifications/initialized", void 0, true);
     return result;
@@ -5907,7 +6272,16 @@ function createProxy(env = process.env, fetchImpl, credentials2) {
       if (!upstream) return { content: [{ type: "text", text: `Hoja API unavailable: ${failure}` }], isError: true };
       try {
         await connect(upstream.protocolVersion);
-        return await upstream.send("tools/call", params, false, signal);
+        const result = await upstream.send("tools/call", params, false, signal);
+        if (sessionDir && !result?.isError) {
+          const activeSid = readActiveSession(sessionDir);
+          if (activeSid) {
+            const text3 = Array.isArray(result?.content) ? result.content.map((c) => c?.text ?? "").join("\n") : "";
+            const touched = extractTouchedIssuesFromTool(String(params?.name ?? ""), params?.arguments, text3);
+            if (touched.length) appendTouchedIssues(sessionDir, activeSid, touched);
+          }
+        }
+        return result;
       } catch (error) {
         return { content: [{ type: "text", text: error.message }], isError: true };
       }
@@ -5919,7 +6293,7 @@ function createProxy(env = process.env, fetchImpl, credentials2) {
 }
 function main() {
   const credentials2 = applyCredentials();
-  const proxy = createProxy(process.env, void 0, credentials2);
+  const proxy = createProxy(process.env, void 0, credentials2, dataDir());
   const send2 = (m) => process.stdout.write(JSON.stringify(m) + "\n");
   const inflight2 = /* @__PURE__ */ new Map();
   createInterface({ input: process.stdin }).on("line", async (line) => {
@@ -5948,192 +6322,9 @@ function main() {
 }
 if (process.argv[1] && /api-proxy\.(m?js|ts)$/.test(process.argv[1])) main();
 
-// src/trace/recorder.ts
-import { appendFileSync as appendFileSync2, existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync5 } from "node:fs";
-import { join as join4 } from "node:path";
-
-// src/trace/redact.ts
-var PATTERNS = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /\bsk-ant-[A-Za-z0-9_-]{16,}/g,
-  /\bsk-[A-Za-z0-9_-]{20,}/g,
-  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
-  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
-  /\bAIza[0-9A-Za-z_-]{35}\b/g,
-  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
-  /\b(?:hoja|lin)_(?:api|oauth)_[A-Za-z0-9]{16,}/g
-];
-var ASSIGNMENTS = /((?:authorization|bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|client[_-]?secret)["']?\s*[:=]\s*["']?(?:bearer\s+)?)([^\s"',;&]{8,})/gi;
-var SECRET_ENV = /(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL)/i;
-var Redactor = class {
-  literals;
-  constructor(env = process.env) {
-    this.literals = Object.entries(env).filter(([name, value]) => SECRET_ENV.test(name) && typeof value === "string" && value.trim().length >= 8).map(([, value]) => value.trim()).sort((a, b) => b.length - a.length);
-  }
-  scrub(text3) {
-    let out = text3;
-    for (const literal of this.literals) if (out.includes(literal)) out = out.split(literal).join("[redacted]");
-    for (const pattern of PATTERNS) out = out.replace(pattern, "[redacted]");
-    return out.replace(ASSIGNMENTS, "$1[redacted]");
-  }
-};
-var FIELD_CAP = 256e3;
-function clipMiddle(text3, max) {
-  if (text3.length <= max) return text3;
-  const head = Math.ceil(max * 0.6), tail = max - head;
-  const omitted = text3.length - head - tail;
-  return `${text3.slice(0, head).replace(/[\uD800-\uDBFF]$/, "")}
-\u2026 [${omitted} chars omitted] \u2026
-${text3.slice(text3.length - tail).replace(/^[\uDC00-\uDFFF]/, "")}`;
-}
-function clip2(text3, max, counted = true) {
-  if (text3.length <= max) return text3;
-  const head = text3.slice(0, max).replace(/[\uD800-\uDBFF]$/, "");
-  return counted ? `${head}\u2026 [+${text3.length - head.length} chars]` : `${head.trimEnd()}\u2026`;
-}
-function taskOps(ops) {
-  return ops.map((op) => op?.op === "create" ? `create ${op.subject ?? ""}`.trim() : op?.op === "update" ? `#${op.taskId ?? "?"}${op.status ? ` \u2192 ${op.status}` : op.active ? " focus" : " update"}` : String(op?.op ?? "")).filter(Boolean).join(", ");
-}
-function inputPreview(tool, input2) {
-  if (input2 == null) return "";
-  if (typeof input2 === "string") return input2;
-  const i = input2;
-  const pick = (...keys) => keys.map((k) => i[k]).find((v) => typeof v === "string" && v);
-  const lead = tool === "Bash" ? pick("command") : /^(Read|Write|Edit|MultiEdit|NotebookEdit)$/.test(tool) ? pick("file_path", "notebook_path") : /^(Grep|Glob)$/.test(tool) ? [pick("pattern"), pick("path")].filter(Boolean).join("  in ") : /^(WebFetch|WebSearch)$/.test(tool) ? pick("url", "query") : tool === "Agent" || tool === "Task" ? pick("description", "prompt") : tool === "TaskManage" && Array.isArray(i.operations) ? taskOps(i.operations) : pick("action", "query", "identifier", "issue", "subject", "description", "url", "name", "command", "path");
-  if (lead) return lead;
-  const pairs = Object.entries(i).filter(([, v]) => v !== null && ["string", "number", "boolean"].includes(typeof v)).map(([k, v]) => `${k}=${typeof v === "string" ? JSON.stringify(v) : v}`);
-  if (pairs.length) return pairs.join(" ");
-  try {
-    return JSON.stringify(input2);
-  } catch {
-    return String(input2);
-  }
-}
-function toolLabel(tool, input2) {
-  const preview = inputPreview(tool, input2).split("\n")[0];
-  return preview && preview !== "{}" ? `${tool} \xB7 ${clip2(preview, 100, false)}` : tool;
-}
-
-// src/trace/recorder.ts
-var SAFE_ID2 = /^[A-Za-z0-9._-]{1,128}$/;
-var tracesDir = (dataDir2) => join4(dataDir2, "traces");
-var eventsPath = (dataDir2, sessionId) => join4(tracesDir(dataDir2), `${SAFE_ID2.test(sessionId) ? sessionId : "invalid-session"}.events.jsonl`);
-var tracePath = (dataDir2, sessionId) => join4(tracesDir(dataDir2), `${SAFE_ID2.test(sessionId) ? sessionId : "invalid-session"}.trace.json`);
-var num = (v) => {
-  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
-  return Number.isFinite(n) && n >= 0 ? n : void 0;
-};
-var str = (v) => typeof v === "string" && v ? v : void 0;
-var TraceRecorder = class {
-  constructor(options) {
-    this.options = options;
-    this.redactor = options.redactor ?? new Redactor();
-    this.full = (options.detail ?? "full") === "full";
-  }
-  options;
-  redactor;
-  full;
-  lastTranscript;
-  text(value, max) {
-    if (!this.full) return void 0;
-    const s = typeof value === "string" ? value : value == null ? "" : (() => {
-      try {
-        return JSON.stringify(value);
-      } catch {
-        return String(value);
-      }
-    })();
-    return s ? clip2(this.redactor.scrub(s), max) : void 0;
-  }
-  /** Whole content (scrubbed), for hooks-only traces: prompts, tool inputs, outputs and errors. */
-  content(value) {
-    if (!this.full) return void 0;
-    const s = typeof value === "string" ? value : value == null ? "" : (() => {
-      try {
-        return JSON.stringify(value, null, 1);
-      } catch {
-        return String(value);
-      }
-    })();
-    return s ? clipMiddle(this.redactor.scrub(s), FIELD_CAP) : void 0;
-  }
-  /** Shape one hook payload (already placeholder-filtered by the bridge) plus the bridge's own decision. */
-  shape(event, payload, output = {}, outputText) {
-    const at = (this.options.now?.() ?? /* @__PURE__ */ new Date()).toISOString();
-    const tool = str(payload.tool_name);
-    const hso = output?.hookSpecificOutput ?? {};
-    const record2 = {
-      at,
-      event,
-      agentId: str(payload.agent_id),
-      agentType: str(payload.agent_type),
-      tool,
-      toolUseId: str(payload.tool_use_id),
-      durationMs: num(payload.duration_ms),
-      permissionMode: str(payload.permission_mode),
-      model: typeof payload.model === "string" ? payload.model : str(payload.model?.id),
-      stepIdx: num(payload.step_idx),
-      invocationNum: num(payload.invocation_num)
-    };
-    if (event === "PreToolUse") {
-      if (hso.permissionDecision === "deny") {
-        record2.decision = "deny";
-        record2.reason = this.content(hso.permissionDecisionReason) ?? "blocked";
-      } else if (hso.additionalContext) record2.context = this.content(hso.additionalContext);
-      record2.label = this.text(inputPreview(tool ?? "", payload.tool_input).split("\n")[0], 200);
-      record2.input = this.content(payload.tool_input && typeof payload.tool_input === "object" && !Object.keys(payload.tool_input).length ? "" : tool === "Bash" ? inputPreview(tool, payload.tool_input) : payload.tool_input);
-    }
-    if (event === "PostToolUse") record2.output = this.content(outputText);
-    if (event === "PostToolUseFailure") {
-      record2.error = this.content(outputText ?? payload.error) ?? "failed";
-      if (payload.is_interrupt === true || payload.is_interrupt === "true") record2.interrupted = true;
-    }
-    if (event === "UserPromptSubmit") record2.prompt = this.content(payload.prompt);
-    if (event === "SessionStart") record2.source = str(payload.source);
-    const transcript = str(payload.transcript_path);
-    if (transcript && !payload.agent_id && this.lastTranscript !== transcript) {
-      record2.transcriptPath = transcript;
-      this.lastTranscript = transcript;
-    }
-    if (event === "SessionEnd") record2.reason = str(payload.reason);
-    if (event === "PreCompact" || event === "PostCompact") record2.trigger = str(payload.trigger);
-    if (event === "Notification") {
-      record2.message = this.text(payload.message, 300);
-      record2.notificationType = str(payload.notification_type);
-    }
-    if (event === "StopFailure") record2.error = this.content(payload.error) ?? "turn failed";
-    if (event === "PermissionDenied") record2.reason = this.text(payload.reason, 300);
-    if (event === "SubagentStop") record2.agentTranscriptPath = str(payload.agent_transcript_path);
-    return Object.fromEntries(Object.entries(record2).filter(([, v]) => v !== void 0));
-  }
-  record(sessionId, event, payload, output, outputText) {
-    if (!sessionId) return;
-    try {
-      const line = JSON.stringify(this.shape(event, payload, output, outputText));
-      mkdirSync3(tracesDir(this.options.dataDir), { recursive: true, mode: 448 });
-      appendFileSync2(eventsPath(this.options.dataDir, sessionId), line + "\n", { mode: 384 });
-    } catch (error) {
-      this.options.log?.(`trace record failed: ${error.message}`);
-    }
-  }
-};
-function readHookRecords(dataDir2, sessionId) {
-  const path = eventsPath(dataDir2, sessionId);
-  if (!existsSync3(path)) return [];
-  return readFileSync5(path, "utf8").split("\n").flatMap((line) => {
-    try {
-      return line.trim() ? [JSON.parse(line)] : [];
-    } catch {
-      return [];
-    }
-  });
-}
-
 // src/trace/collect.ts
-import { existsSync as existsSync4, readdirSync, readFileSync as readFileSync6, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, renameSync } from "node:fs";
-import { basename, dirname as dirname3, join as join5, resolve as resolve3, sep as sep2 } from "node:path";
+import { existsSync as existsSync5, readdirSync, readFileSync as readFileSync7, writeFileSync as writeFileSync3, mkdirSync as mkdirSync5, renameSync as renameSync2 } from "node:fs";
+import { basename, dirname as dirname3, join as join6, resolve as resolve3, sep as sep2 } from "node:path";
 import { statSync as statSync4 } from "node:fs";
 
 // src/trace/schema.ts
@@ -6796,7 +6987,7 @@ function buildTrace(input2) {
     },
     tools: [...tools.values()].sort((x, y) => y.calls - x.calls || y.totalMs - x.totalMs),
     tasks: input2.tasks ?? [],
-    issues: [...new Set((input2.tasks ?? []).map((t) => t.issue).filter((i) => !!i))],
+    issues: [.../* @__PURE__ */ new Set([...(input2.tasks ?? []).map((t) => t.issue).filter((i) => !!i), ...(input2.extraIssues ?? []).filter(Boolean)])],
     spans,
     events: b.events,
     ...b.truncated.length ? { truncated: b.truncated } : {}
@@ -6829,7 +7020,7 @@ function fitTrace(trace, limit = 8 * 1024 * 1024) {
 }
 
 // src/trace/collect.ts
-var PLUGIN_VERSION = "0.5.0";
+var PLUGIN_VERSION = "0.5.3";
 var HOJA_TASK_ENTRY2 = "hoja-task-link";
 var TASK_STATE_ENTRY = "pi-swarm-task-state";
 function hojaLinks(entries) {
@@ -6862,18 +7053,18 @@ function traceTasks(tasks, links) {
 }
 function readSubagents(transcriptPath) {
   if (!transcriptPath) return [];
-  const dir = join5(dirname3(transcriptPath), basename(transcriptPath, ".jsonl"), "subagents");
-  if (!existsSync4(dir)) return [];
+  const dir = join6(dirname3(transcriptPath), basename(transcriptPath, ".jsonl"), "subagents");
+  if (!existsSync5(dir)) return [];
   const out = [];
   for (const file of readdirSync(dir).filter((f) => /^agent-.+\.jsonl$/.test(f)).sort()) {
     const agentId = file.slice("agent-".length, -".jsonl".length);
     let meta = {};
     try {
-      meta = JSON.parse(readFileSync6(join5(dir, `agent-${agentId}.meta.json`), "utf8"));
+      meta = JSON.parse(readFileSync7(join6(dir, `agent-${agentId}.meta.json`), "utf8"));
     } catch {
     }
     try {
-      out.push({ agentId, text: readFileSync6(join5(dir, file), "utf8"), toolUseId: meta.toolUseId, agentType: meta.agentType, description: meta.description });
+      out.push({ agentId, text: readFileSync7(join6(dir, file), "utf8"), toolUseId: meta.toolUseId, agentType: meta.agentType, description: meta.description });
     } catch {
     }
   }
@@ -6886,8 +7077,8 @@ function persistedReader(transcriptPath) {
     const target2 = resolve3(path);
     if (!target2.startsWith(root) || target2.slice(root.length).includes(sep2)) return void 0;
     try {
-      if (statSync4(target2).size > FIELD_CAP * 4) return readFileSync6(target2, "utf8").slice(0, FIELD_CAP * 4);
-      return readFileSync6(target2, "utf8");
+      if (statSync4(target2).size > FIELD_CAP * 4) return readFileSync7(target2, "utf8").slice(0, FIELD_CAP * 4);
+      return readFileSync7(target2, "utf8");
     } catch {
       return void 0;
     }
@@ -6901,20 +7092,25 @@ function collectTrace(options) {
   const transcriptPath = options.transcriptPath || transcriptFromHooks(hooks);
   let transcript;
   try {
-    if (transcriptPath) transcript = readFileSync6(transcriptPath, "utf8");
+    if (transcriptPath) transcript = readFileSync7(transcriptPath, "utf8");
   } catch {
   }
   const journal = options.journal ?? [];
   const links = hojaLinks(journal);
+  const extraIssues = [
+    ...hooks.flatMap((h) => h.touchedIssues ?? []),
+    ...readTouchedIssues(options.dataDir, options.sessionId)
+  ];
   return buildTrace({
     sessionId: options.sessionId,
     transcript,
     subagents: readSubagents(transcriptPath),
     hooks,
     tasks: traceTasks(options.tasks ?? journalTasks(journal), links),
+    extraIssues,
     plugin: `hoja@${PLUGIN_VERSION}`,
     host: options.host ?? (hostOf() === "claude" ? void 0 : hostOf()),
-    detail: options.detail,
+    detail: options.detail ?? traceDetail(options.env),
     redactor: new Redactor(options.env ?? process.env),
     now: options.now,
     readPersisted: persistedReader(transcriptPath)
@@ -6922,10 +7118,10 @@ function collectTrace(options) {
 }
 function saveTrace(dataDir2, trace) {
   const path = tracePath(dataDir2, trace.session.id);
-  mkdirSync4(tracesDir(dataDir2), { recursive: true, mode: 448 });
+  mkdirSync5(tracesDir(dataDir2), { recursive: true, mode: 448 });
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync2(tmp, JSON.stringify(trace), { mode: 384 });
-  renameSync(tmp, path);
+  writeFileSync3(tmp, JSON.stringify(trace), { mode: 384 });
+  renameSync2(tmp, path);
   return path;
 }
 
@@ -6987,8 +7183,8 @@ function renderSummary(trace, extra = {}) {
 }
 
 // src/trace/upload.ts
-import { existsSync as existsSync5, readFileSync as readFileSync7, writeFileSync as writeFileSync3, mkdirSync as mkdirSync5 } from "node:fs";
-import { join as join6 } from "node:path";
+import { existsSync as existsSync6, readFileSync as readFileSync8, writeFileSync as writeFileSync4, mkdirSync as mkdirSync6 } from "node:fs";
+import { join as join7 } from "node:path";
 var HOSTS = { "claude-code": { slug: "claude-code", name: "Claude Code" }, codex: { slug: "codex", name: "Codex" }, antigravity: { slug: "antigravity", name: "Antigravity" } };
 var hostOf2 = (trace) => HOSTS[trace.source.host] ?? { slug: trace.source.host.replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "agent", name: trace.source.host };
 function traceFileName(trace) {
@@ -7013,12 +7209,60 @@ function traceTitle(trace, reason) {
   return traceFileName(trace).replace(`${slug}-`, `${slug}${reason ? `-${reason}` : ""}-`);
 }
 var ATTACH = `mutation HojaTraceAttach($input: AttachmentCreateInput!) { attachmentCreate(input: $input) { success attachment { id url } } }`;
+var LegacyTraceEndpointError = class extends Error {
+  constructor(status) {
+    super(`POST /api/traces returned HTTP ${status}`);
+    this.status = status;
+  }
+  status;
+};
+async function uploadSessionTrace(trace, issues, target2, reason) {
+  const fetchImpl = target2.fetchImpl ?? fetch;
+  const origin = new URL(target2.graphqlUrl).origin;
+  const payload = JSON.stringify({ trace, issues: [...issues], ...reason ? { reason } : {} });
+  const bytes = Buffer.byteLength(JSON.stringify(trace));
+  const signal = () => AbortSignal.timeout(target2.timeoutMs ?? 3e4);
+  const headers = {
+    authorization: `Bearer ${target2.token}`,
+    "content-type": "application/json",
+    "x-hoja-actor": "agent",
+    "x-hoja-session-id": trace.session.id
+  };
+  const res = await fetchImpl(`${origin}/api/traces`, { method: "POST", headers, body: payload, signal: signal() });
+  if (res.status === 404 || res.status === 405) throw new LegacyTraceEndpointError(res.status);
+  const text3 = await res.text();
+  if (res.status === 401 || res.status === 403) throw new Error(`Hoja rejected the token for trace upload (HTTP ${res.status}). Check HOJA_TOKEN.`);
+  if (res.status === 413) throw new Error(`the trace (${Math.round(bytes / 1024)} KB) is larger than Hoja's upload limit`);
+  if (res.status >= 400) throw new Error(`Hoja trace upload failed: HTTP ${res.status} ${text3.slice(0, 200)}`);
+  let parsed;
+  try {
+    parsed = JSON.parse(text3);
+  } catch {
+    throw new Error("Hoja /api/traces returned invalid JSON");
+  }
+  return {
+    url: String(parsed?.url ?? ""),
+    title: String(parsed?.title ?? traceTitle(trace, reason)),
+    subtitle: String(parsed?.subtitle ?? traceSubtitle(trace)),
+    bytes,
+    issues: Array.isArray(parsed?.issues) ? parsed.issues : [],
+    attachments: Array.isArray(parsed?.attachments) ? parsed.attachments : []
+  };
+}
 async function uploadTrace(trace, issue, target2, reason) {
+  try {
+    const res = await uploadSessionTrace(trace, [issue], target2, reason);
+    const att = res.attachments.find((a) => a.issue.toUpperCase() === issue.toUpperCase()) ?? res.attachments[0];
+    if (!att && !res.url) throw new Error(`Hoja did not attach the trace to ${issue} (issue not found or not visible to this token)`);
+    return { issue, url: att?.url ?? res.url, attachmentId: att?.id, title: att?.title ?? res.title, subtitle: att?.subtitle ?? res.subtitle, bytes: res.bytes };
+  } catch (error) {
+    if (!(error instanceof LegacyTraceEndpointError)) throw error;
+  }
   const fetchImpl = target2.fetchImpl ?? fetch;
   const origin = new URL(target2.graphqlUrl).origin;
   const body = JSON.stringify(trace);
   const name = traceTitle(trace, reason);
-  const auth = { authorization: `Bearer ${target2.token}` };
+  const auth = { authorization: `Bearer ${target2.token}`, "x-hoja-actor": "agent", "x-hoja-session-id": trace.session.id };
   const signal = () => AbortSignal.timeout(target2.timeoutMs ?? 3e4);
   const form = new FormData();
   form.append("file", new Blob([body], { type: "application/json" }), name);
@@ -7051,20 +7295,35 @@ async function uploadTrace(trace, issue, target2, reason) {
   if (!parsed?.data?.attachmentCreate?.success) throw new Error(`Hoja did not attach the trace to ${issue} (issue not found or not visible to this token)`);
   return { issue, url, attachmentId: parsed.data.attachmentCreate.attachment?.id, title: name, subtitle, bytes: body.length };
 }
-var ledgerPath = (dataDir2, sessionId) => join6(tracesDir(dataDir2), `${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.uploads.json`);
+var flushPath = (dataDir2, sessionId) => join7(tracesDir(dataDir2), `${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.flush.json`);
+function readFlushState(dataDir2, sessionId) {
+  const path = flushPath(dataDir2, sessionId);
+  if (!existsSync6(path)) return void 0;
+  try {
+    const v = JSON.parse(readFileSync8(path, "utf8"));
+    return typeof v?.lastSpanCount === "number" && Array.isArray(v?.lastIssues) ? v : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function writeFlushState(dataDir2, sessionId, state) {
+  mkdirSync6(tracesDir(dataDir2), { recursive: true, mode: 448 });
+  writeFileSync4(flushPath(dataDir2, sessionId), JSON.stringify(state), { mode: 384 });
+}
+var ledgerPath = (dataDir2, sessionId) => join7(tracesDir(dataDir2), `${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.uploads.json`);
 function readLedger(dataDir2, sessionId) {
   const path = ledgerPath(dataDir2, sessionId);
-  if (!existsSync5(path)) return [];
+  if (!existsSync6(path)) return [];
   try {
-    const v = JSON.parse(readFileSync7(path, "utf8"));
+    const v = JSON.parse(readFileSync8(path, "utf8"));
     return Array.isArray(v) ? v : [];
   } catch {
     return [];
   }
 }
 function appendLedger(dataDir2, sessionId, entry) {
-  mkdirSync5(tracesDir(dataDir2), { recursive: true, mode: 448 });
-  writeFileSync3(ledgerPath(dataDir2, sessionId), JSON.stringify([...readLedger(dataDir2, sessionId), entry], null, 1), { mode: 384 });
+  mkdirSync6(tracesDir(dataDir2), { recursive: true, mode: 448 });
+  writeFileSync4(ledgerPath(dataDir2, sessionId), JSON.stringify([...readLedger(dataDir2, sessionId), entry], null, 1), { mode: 384 });
 }
 
 // src/trace/service.ts
@@ -7074,6 +7333,7 @@ var TraceService = class {
     this.options = options;
   }
   options;
+  syncing = false;
   get env() {
     return this.options.env ?? process.env;
   }
@@ -7128,6 +7388,69 @@ var TraceService = class {
     }
     return lines;
   }
+  /**
+   * Task-independent trace sync (turn settle / session end): if any Hoja issue was touched in this session and
+   * the trace gained spans or new issues since the last upload, upsert the trace idempotently via `/api/traces`.
+   */
+  async syncSession(reason) {
+    if (this.options.upload === "off" || this.options.upload === "manual") return [];
+    if (this.syncing || this.uploadProblem()) return [];
+    const trace = this.build();
+    if (!trace || !trace.issues.length) return [];
+    const prev = readFlushState(this.options.dataDir, trace.session.id);
+    const prevIssues = new Set(prev?.lastIssues ?? []);
+    const unchanged = prev && prev.lastSpanCount === trace.spans.length && trace.issues.every((i) => prevIssues.has(i));
+    if (unchanged) return [];
+    this.syncing = true;
+    try {
+      saveTrace(this.options.dataDir, trace);
+      const target2 = { graphqlUrl: resolveHojaUrl(this.env), token: resolveHojaToken(this.env), fetchImpl: this.options.fetchImpl };
+      const out = [];
+      try {
+        const res = await uploadSessionTrace(trace, trace.issues, target2, reason);
+        for (const att of res.attachments) {
+          appendLedger(this.options.dataDir, trace.session.id, {
+            issue: att.issue,
+            at: (/* @__PURE__ */ new Date()).toISOString(),
+            url: att.url,
+            attachmentId: att.id,
+            reason
+          });
+          out.push(`Hoja trace: ${att.updated ? "updated" : "attached"} session trace on ${att.issue} (${att.subtitle}).`);
+        }
+        writeFlushState(this.options.dataDir, trace.session.id, {
+          lastSpanCount: trace.spans.length,
+          lastIssues: [.../* @__PURE__ */ new Set([...prevIssues, ...trace.issues])],
+          at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        return out;
+      } catch (error) {
+        if (!(error instanceof LegacyTraceEndpointError)) {
+          this.options.log?.(`session trace sync failed (${reason}): ${error.message}`);
+          return [];
+        }
+        const uploaded = new Set(readLedger(this.options.dataDir, trace.session.id).filter((e) => e.url).map((e) => e.issue));
+        for (const issue of trace.issues) {
+          if (uploaded.has(issue)) continue;
+          try {
+            const r = await uploadTrace(trace, issue, target2, reason);
+            appendLedger(this.options.dataDir, trace.session.id, { issue, at: (/* @__PURE__ */ new Date()).toISOString(), url: r.url, attachmentId: r.attachmentId, reason });
+            out.push(`Hoja trace: attached this session's trace to ${issue} (${r.subtitle}).`);
+          } catch (err) {
+            this.options.log?.(`trace fallback failed for ${issue}: ${err.message}`);
+          }
+        }
+        writeFlushState(this.options.dataDir, trace.session.id, {
+          lastSpanCount: trace.spans.length,
+          lastIssues: [.../* @__PURE__ */ new Set([...prevIssues, ...trace.issues])],
+          at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        return out;
+      }
+    } finally {
+      this.syncing = false;
+    }
+  }
   contentNotice() {
     return this.options.detail === "full" ? "It includes full content (prompts, tool inputs and outputs, model responses) with secrets scrubbed; set trace_detail to metadata to send only timings, statuses and token counts." : "It includes timings, statuses and token counts only (trace_detail: metadata).";
   }
@@ -7179,6 +7502,8 @@ function createRuntime(options) {
   const tracing = options.trace?.enabled !== false;
   const recorder = tracing ? new TraceRecorder({ dataDir: options.dataDir, detail: options.trace?.detail, log: options.log }) : void 0;
   const bridge2 = new HookBridge(shim2, manager, { ...options, recorder });
+  const extraHeaders = () => ({ "x-hoja-actor": "agent", ...shim2.sessionId ? { "x-hoja-session-id": shim2.sessionId } : {} });
+  const traceCredentials = options.trace?.env ? new Credentials({ ...options.trace.env }) : credentials;
   const traces = new TraceService({
     dataDir: options.dataDir,
     upload: tracing ? options.trace?.upload ?? "completion" : "off",
@@ -7186,20 +7511,23 @@ function createRuntime(options) {
     // Uploads go through the same credential as everything else: a CLI sign-in's token is refreshed before expiry
     // and once after a 401 (src/credentials.ts).
     env: options.trace?.env,
-    fetchImpl: options.trace?.fetchImpl ?? authFetch(credentials),
+    fetchImpl: options.trace?.fetchImpl ?? authFetch(traceCredentials, void 0, extraHeaders),
     log: options.log,
     session: () => ({ id: shim2.sessionId, transcriptPath: shim2.transcript.path, entries: shim2.branch(), tasks: manager.snapshot().tasks })
   });
   registerTaskHooks(shim2.api, manager, { enforcementMode: "off", silent: true });
   shim2.api.registerCommand("tasks", { description: "Show the read-only task board", handler: () => taskBoard(manager) });
   if (options.hoja !== false) {
-    const client = options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials) });
+    const client = options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials, void 0, extraHeaders) });
     registerHojaMode(shim2.api, client);
   }
   shim2.api.on("tool_result", async (event) => {
     if (event?.toolName !== "TaskManage" || event.isError) return void 0;
     const lines = await traces.afterTaskManage();
     return lines.length ? { content: [...event.content ?? [], { type: "text", text: lines.join("\n") }] } : void 0;
+  });
+  shim2.api.on("turn_end", async () => {
+    await traces.syncSession("turn");
   });
   shim2.api.registerCommand("trace", {
     description: "Session trace: summary (default), upload [ISSUE], path",
@@ -7276,16 +7604,16 @@ function taskBoard(manager, width = 100) {
 
 // src/agy-socket.ts
 import { createConnection, createServer } from "node:net";
-import { chmodSync, existsSync as existsSync6, mkdirSync as mkdirSync6, readFileSync as readFileSync8, unlinkSync } from "node:fs";
+import { chmodSync, existsSync as existsSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync9, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 var uid = () => typeof process.getuid === "function" ? process.getuid() : "user";
-var socketDir = (env = process.env) => env.HOJA_AGY_SOCKET_DIR?.trim() || join7(tmpdir(), `hoja-agy-${uid()}`);
-var socketPath = (agyPid, env = process.env) => join7(socketDir(env), `${agyPid}.sock`);
+var socketDir = (env = process.env) => env.HOJA_AGY_SOCKET_DIR?.trim() || join8(tmpdir(), `hoja-agy-${uid()}`);
+var socketPath = (agyPid, env = process.env) => join8(socketDir(env), `${agyPid}.sock`);
 function listen(path, handle, log2) {
-  mkdirSync6(join7(path, ".."), { recursive: true, mode: 448 });
+  mkdirSync7(join8(path, ".."), { recursive: true, mode: 448 });
   try {
-    chmodSync(join7(path, ".."), 448);
+    chmodSync(join8(path, ".."), 448);
   } catch {
   }
   try {
@@ -7378,7 +7706,7 @@ if (hostOf() === "antigravity") listen(socketPath(process.ppid), async (message)
   const event = String(message?.event ?? "");
   const out = await bridge.handle(event, message?.payload ?? {});
   if (event === "Stop") setImmediate(() => {
-    runtime.traces.run("path").catch((error) => log(`trace save failed: ${error.message}`));
+    runtime.traces.syncSession("turn").then((lines) => lines.length ? void 0 : runtime.traces.run("path")).catch((error) => log(`trace sync failed: ${error.message}`));
   });
   return out;
 }, log);

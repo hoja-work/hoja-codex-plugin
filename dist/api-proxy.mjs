@@ -34,6 +34,10 @@ function credentialValue(names, env = process.env) {
   return void 0;
 }
 
+// src/env.ts
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+
 // src/credentials.ts
 import { execFileSync } from "node:child_process";
 var URL_VARS = ["HOJA_API_URL", "LINEAR_API_URL", "HOJA_MCP_URL"];
@@ -128,12 +132,20 @@ var Credentials = class {
     }
   }
 };
-function authFetch(credentials2, base = fetch) {
+function authFetch(credentials2, base = fetch, extraHeaders) {
   const withToken = (init) => {
     const headers = { ...init?.headers ?? {} };
-    for (const key of Object.keys(headers)) if (key.toLowerCase() === "authorization") delete headers[key];
     const token = credentials2.token();
-    if (token) headers.authorization = `Bearer ${token}`;
+    if (token) {
+      for (const key of Object.keys(headers)) if (key.toLowerCase() === "authorization") delete headers[key];
+      headers.authorization = `Bearer ${token}`;
+    }
+    if (!Object.keys(headers).some((k) => k.toLowerCase() === "x-hoja-actor")) headers["x-hoja-actor"] = "agent";
+    if (extraHeaders) {
+      for (const [k, v] of Object.entries(extraHeaders())) {
+        if (v && !Object.keys(headers).some((existing) => existing.toLowerCase() === k.toLowerCase())) headers[k] = v;
+      }
+    }
     return { ...init, headers };
   };
   return async (url, init) => {
@@ -173,6 +185,181 @@ function applyCredentials() {
   applyUserConfig();
   return credentials.apply();
 }
+function dataDir(env = process.env, script = process.argv[1]) {
+  const explicit = env.HOJA_PLUGIN_DATA?.trim() || env.CLAUDE_PLUGIN_DATA?.trim() || env.PLUGIN_DATA?.trim();
+  if (explicit) return explicit;
+  const host = env.HOJA_PLUGIN_HOST?.trim().toLowerCase();
+  if (host === "antigravity" || host === "agy") return join(homedir(), ".gemini", "antigravity-cli", "plugin-data", "hoja");
+  if (host !== "codex") return join(homedir(), ".claude", "plugins", "data", "hoja-standalone");
+  const installed = script ? /^(.*)[\\/]plugins[\\/]cache[\\/]([^\\/]+)[\\/]([^\\/]+)[\\/][^\\/]+$/.exec(resolve(dirname(resolve(script)), "..")) : null;
+  if (installed) return join(installed[1], "plugins", "data", `${installed[3]}-${installed[2]}`);
+  return join(env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "plugins", "data", "hoja-standalone");
+}
+
+// src/host.ts
+var PROFILES = {
+  // Claude Code may normalize the server name's hyphen.
+  claude: { host: "claude", ownToolPrefixes: ["mcp__plugin_hoja_hoja__"], apiToolPrefixes: ["mcp__plugin_hoja_hoja-api__", "mcp__plugin_hoja_hoja_api__"], bashAliases: [] },
+  codex: { host: "codex", ownToolPrefixes: ["mcp__hoja__"], apiToolPrefixes: ["mcp__hoja_api__", "mcp__hoja-api__"], bashAliases: ["exec_command", "shell", "local_shell", "container.exec"] },
+  // Antigravity names a plugin's MCP server `<plugin>_<server>` and wraps every MCP call in `call_mcp_tool`; agy.ts
+  // unwraps it to `mcp__<ServerName>__<ToolName>`. Its shell tool is `run_command`.
+  antigravity: { host: "antigravity", ownToolPrefixes: ["mcp__hoja_hoja__"], apiToolPrefixes: ["mcp__hoja_hoja-api__", "mcp__hoja_hoja_api__"], bashAliases: ["run_command"] }
+};
+var hostOf = (env = process.env) => {
+  const v = env.HOJA_PLUGIN_HOST?.trim().toLowerCase();
+  return v === "codex" ? "codex" : v === "antigravity" || v === "agy" ? "antigravity" : "claude";
+};
+var profile = (env = process.env) => PROFILES[hostOf(env)];
+
+// src/trace/touched.ts
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join as join3 } from "node:path";
+
+// src/transcript.ts
+var PI_API_PREFIX = "mcp__hoja__";
+var ownToolPrefix = (name) => profile().ownToolPrefixes.find((prefix) => name.startsWith(prefix));
+var canonicalToolName = (name) => {
+  const { apiToolPrefixes, bashAliases } = profile();
+  const own = ownToolPrefix(name);
+  if (own) return name.slice(own.length);
+  const api = apiToolPrefixes.find((prefix) => name.startsWith(prefix));
+  if (api) return PI_API_PREFIX + name.slice(api.length);
+  return bashAliases.includes(name) ? "Bash" : name;
+};
+
+// src/trace/recorder.ts
+import { join as join2 } from "node:path";
+var tracesDir = (dataDir2) => join2(dataDir2, "traces");
+
+// src/trace/touched.ts
+var SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/;
+var ISSUE_RE = /\b([A-Z][A-Z0-9]{1,9}-\d+(?:-[A-Za-z]-\d+)*)\b/g;
+var HOJA_WRITE_OPS = /* @__PURE__ */ new Set([
+  "hoja_issueCreate",
+  "hoja_taskCreate",
+  "hoja_issueUpdate",
+  "hoja_taskUpdate",
+  "hoja_issueMove",
+  "hoja_issueArchive",
+  "hoja_issueDelete",
+  "hoja_issueSubscribe",
+  "hoja_issueUnsubscribe",
+  "hoja_commentCreate",
+  "hoja_commentUpdate",
+  "hoja_commentDelete",
+  "hoja_issueDecisionCreate",
+  "hoja_taskDecisionCreate",
+  "hoja_issueDecisionAnswer",
+  "hoja_taskDecisionAnswer",
+  "hoja_issueDecisionCancel",
+  "hoja_taskDecisionCancel",
+  "hoja_issueReviewRequest",
+  "hoja_taskReviewRequest",
+  "hoja_attachmentCreate",
+  "hoja_githubLinkAdd"
+]);
+var BASH_HOJA_WRITE = /\bhoja\s+(?:issue|task|comment|decision)\s+(?:create|update|comment|edit|close|reopen|archive|move|assign|answer|ask)\b/i;
+function writeAtomic(path, value) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), { mode: 384 });
+  renameSync(tmp, path);
+}
+function readActiveSession(dataDir2, ppid = process.ppid, maxAgeMs = 24 * 60 * 60 * 1e3) {
+  if (!dataDir2) return void 0;
+  const dir = tracesDir(dataDir2);
+  for (const name of [...ppid > 1 ? [`.active-${ppid}.json`] : [], ".active.json"]) {
+    const file = join3(dir, name);
+    if (!existsSync(file)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8"));
+      const sid = typeof parsed?.sessionId === "string" ? parsed.sessionId : "";
+      const age = Date.now() - Date.parse(String(parsed?.updatedAt ?? ""));
+      if (SAFE_ID.test(sid) && (!Number.isFinite(age) || age <= maxAgeMs)) return sid;
+    } catch {
+    }
+  }
+  return void 0;
+}
+function isHojaWriteTool(rawTool, params) {
+  const canonical = canonicalToolName(rawTool);
+  const mcp = /^mcp__(?:plugin_[^_]+_)?[^_]+__(.+)$/.exec(canonical);
+  const op = mcp ? mcp[1] : canonical;
+  if (HOJA_WRITE_OPS.has(op)) return { isWrite: true, op };
+  if (canonical === "Bash") {
+    const cmd = typeof params?.command === "string" ? params.command : "";
+    if (BASH_HOJA_WRITE.test(cmd)) return { isWrite: true, op: "Bash" };
+  }
+  return { isWrite: false, op };
+}
+function collectIdentifiers(value, out, depth = 0) {
+  if (depth > 5 || value == null) return;
+  if (typeof value === "string") {
+    for (const m of value.matchAll(ISSUE_RE)) out.add(m[1]);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectIdentifiers(item, out, depth + 1);
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "identifier" || k === "issueId" || k === "id" || k === "url" || k === "issue" || k === "task" || k === "comment" || k === "decision" || /^(?:issue|task|comment|decision|attachment|githubLink)[A-Z]/.test(k)) {
+        collectIdentifiers(v, out, depth + 1);
+      }
+    }
+  }
+}
+function extractTouchedIssuesFromTool(rawTool, params, outputText) {
+  const { isWrite, op } = isHojaWriteTool(rawTool, params);
+  if (!isWrite) return [];
+  const found = /* @__PURE__ */ new Set();
+  if (op !== "Bash" && params && typeof params === "object") {
+    const p = params;
+    for (const key of ["issueId", "id", "identifier"]) {
+      if (typeof p[key] === "string") collectIdentifiers(p[key], found);
+    }
+  } else if (op === "Bash" && typeof params?.command === "string") {
+    const cmd = String(params.command);
+    const head = cmd.split(/\s--(?:body|description|title)\b/)[0] ?? cmd;
+    collectIdentifiers(head, found);
+  }
+  if (outputText) {
+    try {
+      const parsed = JSON.parse(outputText);
+      collectIdentifiers(parsed, found);
+    } catch {
+      if (op !== "Bash") collectIdentifiers(outputText, found);
+      else {
+        for (const m of outputText.slice(0, 1e3).matchAll(ISSUE_RE)) found.add(m[1]);
+      }
+    }
+  }
+  return [...found];
+}
+var touchedPath = (dataDir2, sessionId) => join3(tracesDir(dataDir2), `${SAFE_ID.test(sessionId) ? sessionId : "invalid-session"}.issues.json`);
+function readTouchedIssues(dataDir2, sessionId) {
+  if (!dataDir2 || !SAFE_ID.test(sessionId)) return [];
+  const path = touchedPath(dataDir2, sessionId);
+  if (!existsSync(path)) return [];
+  try {
+    const v = JSON.parse(readFileSync(path, "utf8"));
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string" && !!x) : [];
+  } catch {
+    return [];
+  }
+}
+function appendTouchedIssues(dataDir2, sessionId, issues) {
+  if (!dataDir2 || !SAFE_ID.test(sessionId) || !issues.length) return [];
+  try {
+    const merged = [.../* @__PURE__ */ new Set([...readTouchedIssues(dataDir2, sessionId), ...issues.filter(Boolean)])];
+    const path = touchedPath(dataDir2, sessionId);
+    mkdirSync(tracesDir(dataDir2), { recursive: true, mode: 448 });
+    writeAtomic(path, merged);
+    return merged;
+  } catch {
+    return [];
+  }
+}
 
 // src/api-proxy.ts
 function resolveMcpUrl(env = process.env) {
@@ -191,14 +378,16 @@ function resolveMcpUrl(env = process.env) {
   }
 }
 var UpstreamMcp = class {
-  constructor(url, token, fetchImpl = fetch) {
+  constructor(url, token, fetchImpl = fetch, extraHeaders) {
     this.url = url;
     this.token = token;
     this.fetchImpl = fetchImpl;
+    this.extraHeaders = extraHeaders;
   }
   url;
   token;
   fetchImpl;
+  extraHeaders;
   session;
   seq = 0;
   protocolVersion = "2025-06-18";
@@ -208,8 +397,14 @@ var UpstreamMcp = class {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       authorization: `Bearer ${this.token}`,
-      "mcp-protocol-version": this.protocolVersion
+      "mcp-protocol-version": this.protocolVersion,
+      "x-hoja-actor": "agent"
     };
+    if (this.extraHeaders) {
+      for (const [k, v] of Object.entries(this.extraHeaders())) {
+        if (v) headers[k] = v;
+      }
+    }
     if (this.session) headers["mcp-session-id"] = this.session;
     const response = await this.fetchImpl(this.url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", ...id ? { id } : {}, method, ...params ? { params } : {} }), signal });
     const session = response.headers.get("mcp-session-id");
@@ -243,18 +438,26 @@ function parseMessages(body, contentType) {
   }
   return out;
 }
-function createProxy(env = process.env, fetchImpl, credentials2) {
+function createProxy(env = process.env, fetchImpl, credentials2, pluginDataDir) {
   const url = resolveMcpUrl(env);
   const token = credentials2 ? credentials2.token() : resolveHojaToken(env);
   const configProblem = credentials2?.problems.join(" ") ?? "";
   const problem = configProblem || (!url ? HOJA_ENDPOINT_HINT : !token ? `${MISSING_HOJA_TOKEN}. ${SIGN_IN_HINT}` : "");
-  const transport = credentials2 ? authFetch(credentials2, fetchImpl ?? fetch) : fetchImpl;
-  const upstream = problem ? void 0 : new UpstreamMcp(url, token, transport);
+  const sessionDir = pluginDataDir ?? (env.HOJA_PLUGIN_DATA || env.CLAUDE_PLUGIN_DATA || env.PLUGIN_DATA ? dataDir(env) : "");
+  const host = hostOf(env);
+  const clientName = host === "claude" ? "claude-code" : host;
+  const headerProvider = () => ({
+    "x-hoja-actor": "agent",
+    "x-hoja-client": clientName,
+    ...sessionDir ? { "x-hoja-session-id": readActiveSession(sessionDir) } : {}
+  });
+  const transport = credentials2 ? authFetch(credentials2, fetchImpl ?? fetch, headerProvider) : fetchImpl;
+  const upstream = problem ? void 0 : new UpstreamMcp(url, token, transport, headerProvider);
   let ready;
   let failure = problem;
   const connect = (protocolVersion) => ready ??= (async () => {
     upstream.protocolVersion = protocolVersion;
-    const result = await upstream.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: "hoja-claude-plugin", version: "0.2.0" } });
+    const result = await upstream.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: `hoja-${host}-plugin`, version: "0.2.0" } });
     if (typeof result?.protocolVersion === "string") upstream.protocolVersion = result.protocolVersion;
     await upstream.send("notifications/initialized", void 0, true);
     return result;
@@ -296,7 +499,16 @@ function createProxy(env = process.env, fetchImpl, credentials2) {
       if (!upstream) return { content: [{ type: "text", text: `Hoja API unavailable: ${failure}` }], isError: true };
       try {
         await connect(upstream.protocolVersion);
-        return await upstream.send("tools/call", params, false, signal);
+        const result = await upstream.send("tools/call", params, false, signal);
+        if (sessionDir && !result?.isError) {
+          const activeSid = readActiveSession(sessionDir);
+          if (activeSid) {
+            const text = Array.isArray(result?.content) ? result.content.map((c) => c?.text ?? "").join("\n") : "";
+            const touched = extractTouchedIssuesFromTool(String(params?.name ?? ""), params?.arguments, text);
+            if (touched.length) appendTouchedIssues(sessionDir, activeSid, touched);
+          }
+        }
+        return result;
       } catch (error) {
         return { content: [{ type: "text", text: error.message }], isError: true };
       }
@@ -308,7 +520,7 @@ function createProxy(env = process.env, fetchImpl, credentials2) {
 }
 function main() {
   const credentials2 = applyCredentials();
-  const proxy = createProxy(process.env, void 0, credentials2);
+  const proxy = createProxy(process.env, void 0, credentials2, dataDir());
   const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
   const inflight = /* @__PURE__ */ new Map();
   createInterface({ input: process.stdin }).on("line", async (line) => {

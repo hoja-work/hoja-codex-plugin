@@ -48,6 +48,7 @@ export async function finishSession(input: EndInput, env: NodeJS.ProcessEnv = pr
 	out.push(`trace saved: ${summary}`);
 	if (mode === "off" || mode === "manual" || traces.uploadProblem()) return out;
 	out.push(...await traces.afterTaskManage());
+	out.push(...await traces.syncSession("session-end"));
 	if (mode === "session-end") {
 		const done = new Set(readLedger(dir, sessionId).filter(e => e.reason === "session-end").map(e => e.issue));
 		for (const issue of new Set(hojaLinks(shim.branch()).values())) {

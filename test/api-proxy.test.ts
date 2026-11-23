@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProxy, parseMessages, resolveMcpUrl, type Fetch } from "../src/api-proxy.ts";
+import { readTouchedIssues, recordActiveSession } from "../src/trace/touched.ts";
 import { canonicalToolName } from "../src/transcript.ts";
 import { createRuntime, hojaDoctor } from "../src/runtime.ts";
 
@@ -40,13 +41,19 @@ describe("hosted Hoja API proxy", () => {
 		const noToken = createProxy({ HOJA_API_URL: "https://x.hoja.work/graphql" });
 		expect((await noToken.handle("initialize", {})).instructions).toContain("HOJA_TOKEN is not set");
 	});
-	it("forwards initialize instructions, paginated tools/list and tools/call with a Bearer token", async () => {
+	it("forwards initialize instructions, paginated tools/list and tools/call with a Bearer token and actor/session headers", async () => {
 		const calls: any[] = [];
-		const proxy = createProxy({ HOJA_API_URL: "https://x.hoja.work/graphql", HOJA_TOKEN: "tok" }, fakeHoja(calls));
+		const dataDir = mkdtempSync(join(tmpdir(), "hoja-proxy-act-"));
+		recordActiveSession(dataDir, "sess-proxy-1", process.ppid);
+		const proxy = createProxy({ HOJA_API_URL: "https://x.hoja.work/graphql", HOJA_TOKEN: "tok", HOJA_PLUGIN_DATA: dataDir }, fakeHoja(calls));
 		expect((await proxy.handle("initialize", { protocolVersion: "2025-06-18" })).instructions).toBe("Hoja is a work tracker");
 		expect((await proxy.handle("tools/list", {})).tools.map((t: any) => t.name)).toEqual(["hoja_issues", "hoja_commentCreate"]);
 		expect(await proxy.handle("tools/call", { name: "hoja_issues", arguments: {} })).toEqual({ content: [{ type: "text", text: "called hoja_issues" }] });
+		expect(readTouchedIssues(dataDir, "sess-proxy-1")).toEqual([]);
+		await proxy.handle("tools/call", { name: "hoja_commentCreate", arguments: { issueId: "HOJA-77", body: "hi" } });
+		expect(readTouchedIssues(dataDir, "sess-proxy-1")).toEqual(["HOJA-77"]);
 		expect(calls.every(c => c.headers.authorization === "Bearer tok")).toBe(true);
+		expect(calls.every(c => c.headers["x-hoja-actor"] === "agent" && c.headers["x-hoja-session-id"] === "sess-proxy-1")).toBe(true);
 		expect(calls.filter(c => c.body.method === "initialize")).toHaveLength(1);
 	});
 	it("reports a rejected token as a tool error, not a crash", async () => {

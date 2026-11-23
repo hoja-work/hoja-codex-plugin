@@ -8,6 +8,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { clip, clipMiddle, FIELD_CAP, inputPreview, Redactor } from "./redact.ts";
+import { appendTouchedIssues, extractTouchedIssuesFromTool } from "./touched.ts";
 
 export interface HookRecord {
 	at: string;
@@ -40,6 +41,8 @@ export interface HookRecord {
 	/** Antigravity: the transcript step a tool call's result lands in, and which model call of the turn this is. */
 	stepIdx?: number;
 	invocationNum?: number;
+	/** Hoja issue identifiers touched by a write tool call in this session (outside TaskManage). */
+	touchedIssues?: string[];
 }
 
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/;
@@ -95,7 +98,11 @@ export class TraceRecorder {
 			record.label = this.text(inputPreview(tool ?? "", payload.tool_input).split("\n")[0], 200);
 			record.input = this.content(payload.tool_input && typeof payload.tool_input === "object" && !Object.keys(payload.tool_input).length ? "" : tool === "Bash" ? inputPreview(tool, payload.tool_input) : payload.tool_input);
 		}
-		if (event === "PostToolUse") record.output = this.content(outputText);
+		if (event === "PostToolUse") {
+			record.output = this.content(outputText);
+			const touched = tool ? extractTouchedIssuesFromTool(tool, payload.tool_input, outputText) : [];
+			if (touched.length) record.touchedIssues = touched;
+		}
 		if (event === "PostToolUseFailure") {
 			record.error = this.content(outputText ?? payload.error) ?? "failed";
 			if (payload.is_interrupt === true || payload.is_interrupt === "true") record.interrupted = true;
@@ -117,7 +124,9 @@ export class TraceRecorder {
 	record(sessionId: string | undefined, event: string, payload: Record<string, any>, output?: Record<string, any>, outputText?: string) {
 		if (!sessionId) return;
 		try {
-			const line = JSON.stringify(this.shape(event, payload, output, outputText));
+			const shaped = this.shape(event, payload, output, outputText);
+			if (shaped.touchedIssues?.length) appendTouchedIssues(this.options.dataDir, sessionId, shaped.touchedIssues);
+			const line = JSON.stringify(shaped);
 			mkdirSync(tracesDir(this.options.dataDir), { recursive: true, mode: 0o700 });
 			appendFileSync(eventsPath(this.options.dataDir, sessionId), line + "\n", { mode: 0o600 });
 		} catch (error) { this.options.log?.(`trace record failed: ${(error as Error).message}`); }

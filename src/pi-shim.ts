@@ -8,6 +8,7 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { recordActiveSession } from "./trace/touched.ts";
 import { TranscriptReader } from "./transcript.ts";
 
 export type Handler = (event: any, ctx: any) => any;
@@ -117,6 +118,7 @@ export class PiShim {
 	async bindSession(sessionId: string, transcriptPath?: string, cwd?: string) {
 		if (cwd) this.cwd = cwd;
 		this.transcript.setPath(transcriptPath);
+		if (sessionId) recordActiveSession(this.options.dataDir, sessionId);
 		if (sessionId === this.sessionId) return false;
 		if (this.sessionId) await this.emit("session_shutdown");
 		this.sessionId = sessionId;

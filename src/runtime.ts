@@ -15,7 +15,7 @@ import { canonicalToolName } from "./transcript.ts";
 import { PiShim, type ShimOptions } from "./pi-shim.ts";
 import { HookBridge, type BridgeOptions } from "./hook-bridge.ts";
 import { resolveMcpUrl, UpstreamMcp } from "./api-proxy.ts";
-import { authFetch, SIGN_IN_HINT } from "./credentials.ts";
+import { authFetch, Credentials, SIGN_IN_HINT } from "./credentials.ts";
 import { credentials } from "./env.ts";
 import { TraceRecorder } from "./trace/recorder.ts";
 import { TraceService } from "./trace/service.ts";
@@ -52,11 +52,13 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 	const tracing = options.trace?.enabled !== false;
 	const recorder = tracing ? new TraceRecorder({ dataDir: options.dataDir, detail: options.trace?.detail, log: options.log }) : undefined;
 	const bridge = new HookBridge(shim, manager, { ...options, recorder });
+	const extraHeaders = () => ({ "x-hoja-actor": "agent", ...(shim.sessionId ? { "x-hoja-session-id": shim.sessionId } : {}) });
+	const traceCredentials = options.trace?.env ? new Credentials({ ...options.trace.env }) : credentials;
 	const traces = new TraceService({
 		dataDir: options.dataDir, upload: tracing ? options.trace?.upload ?? "completion" : "off", detail: options.trace?.detail ?? "full",
 		// Uploads go through the same credential as everything else: a CLI sign-in's token is refreshed before expiry
 		// and once after a 401 (src/credentials.ts).
-		env: options.trace?.env, fetchImpl: options.trace?.fetchImpl ?? (authFetch(credentials) as FetchLike), log: options.log,
+		env: options.trace?.env, fetchImpl: options.trace?.fetchImpl ?? (authFetch(traceCredentials, undefined, extraHeaders) as FetchLike), log: options.log,
 		session: () => ({ id: shim.sessionId, transcriptPath: shim.transcript.path, entries: shim.branch(), tasks: manager.snapshot().tasks }),
 	});
 	// extensions/taskmanage/extension.ts: the secondary coordinator is silent bookkeeping (task audit events) only.
@@ -66,7 +68,7 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 	// Publication goes through the same client Trebol's hoja-mode uses, unwrapped: Trebol itself sends the task's
 	// description and priority with the create.
 	if (options.hoja !== false) {
-		const client = (options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials) as any })) as object;
+		const client = (options.hojaClient ?? new HojaClient({ fetch: authFetch(credentials, undefined, extraHeaders) as any })) as object;
 		registerHojaMode(shim.api, client as any);
 	}
 	// Registered after hoja-mode, so its tool_result handler runs after publication linked the issue and closed it:
@@ -75,6 +77,10 @@ export function createRuntime(options: RuntimeOptions): Runtime {
 		if (event?.toolName !== "TaskManage" || event.isError) return undefined;
 		const lines = await traces.afterTaskManage();
 		return lines.length ? { content: [...(event.content ?? []), { type: "text", text: lines.join("\n") }] } : undefined;
+	});
+	// Task-independent trace sync: flush idempotently at turn settle when any Hoja issue was touched.
+	shim.api.on("turn_end", async () => {
+		await traces.syncSession("turn");
 	});
 	shim.api.registerCommand("trace", {
 		description: "Session trace: summary (default), upload [ISSUE], path",

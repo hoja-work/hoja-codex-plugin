@@ -10,8 +10,10 @@
  */
 import { createInterface } from "node:readline";
 import { HOJA_ENDPOINT_HINT, MISSING_HOJA_TOKEN, resolveHojaToken, resolveHojaUrl } from "../vendor/trebol/.pi/lib/claw/hoja.ts";
-import { applyCredentials } from "./env.ts";
+import { applyCredentials, dataDir } from "./env.ts";
 import { authFetch, normalizeEndpoint, SIGN_IN_HINT, type Credentials } from "./credentials.ts";
+import { hostOf } from "./host.ts";
+import { appendTouchedIssues, extractTouchedIssuesFromTool, readActiveSession } from "./trace/touched.ts";
 
 type Json = Record<string, any>;
 type Env = Record<string, string | undefined>;
@@ -32,14 +34,25 @@ export class UpstreamMcp {
 	private session?: string;
 	private seq = 0;
 	protocolVersion = "2025-06-18";
-	constructor(readonly url: string, private readonly token: string, private readonly fetchImpl: Fetch = fetch as any) {}
+	constructor(
+		readonly url: string,
+		private readonly token: string,
+		private readonly fetchImpl: Fetch = fetch as any,
+		private readonly extraHeaders?: () => Record<string, string | undefined>,
+	) {}
 
 	async send(method: string, params: Json | undefined, notification = false, signal?: AbortSignal): Promise<any> {
 		const id = notification ? undefined : `up-${++this.seq}`;
 		const headers: Record<string, string> = {
 			"content-type": "application/json", accept: "application/json, text/event-stream",
 			authorization: `Bearer ${this.token}`, "mcp-protocol-version": this.protocolVersion,
+			"x-hoja-actor": "agent",
 		};
+		if (this.extraHeaders) {
+			for (const [k, v] of Object.entries(this.extraHeaders())) {
+				if (v) headers[k] = v;
+			}
+		}
 		if (this.session) headers["mcp-session-id"] = this.session;
 		const response = await this.fetchImpl(this.url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", ...(id ? { id } : {}), method, ...(params ? { params } : {}) }), signal });
 		const session = response.headers.get("mcp-session-id");
@@ -65,18 +78,26 @@ export function parseMessages(body: string, contentType: string): Json[] {
 	return out;
 }
 
-export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentials?: Credentials) {
+export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentials?: Credentials, pluginDataDir?: string) {
 	const url = resolveMcpUrl(env);
 	const token = credentials ? credentials.token() : resolveHojaToken(env);
 	const configProblem = credentials?.problems.join(" ") ?? "";
 	const problem = configProblem || (!url ? HOJA_ENDPOINT_HINT : !token ? `${MISSING_HOJA_TOKEN}. ${SIGN_IN_HINT}` : "");
-	const transport = credentials ? authFetch(credentials, (fetchImpl ?? fetch) as any) as Fetch : fetchImpl;
-	const upstream = problem ? undefined : new UpstreamMcp(url, token, transport);
+	const sessionDir = pluginDataDir ?? (env.HOJA_PLUGIN_DATA || env.CLAUDE_PLUGIN_DATA || env.PLUGIN_DATA ? dataDir(env) : "");
+	const host = hostOf(env);
+	const clientName = host === "claude" ? "claude-code" : host;
+	const headerProvider = () => ({
+		"x-hoja-actor": "agent",
+		"x-hoja-client": clientName,
+		...(sessionDir ? { "x-hoja-session-id": readActiveSession(sessionDir) } : {}),
+	});
+	const transport = credentials ? authFetch(credentials, (fetchImpl ?? fetch) as any, headerProvider) as Fetch : fetchImpl;
+	const upstream = problem ? undefined : new UpstreamMcp(url, token, transport, headerProvider);
 	let ready: Promise<Json> | undefined;
 	let failure = problem;
 	const connect = (protocolVersion: string) => ready ??= (async () => {
 		upstream!.protocolVersion = protocolVersion;
-		const result = await upstream!.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: "hoja-claude-plugin", version: "0.2.0" } });
+		const result = await upstream!.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: `hoja-${host}-plugin`, version: "0.2.0" } });
 		if (typeof result?.protocolVersion === "string") upstream!.protocolVersion = result.protocolVersion;
 		await upstream!.send("notifications/initialized", undefined, true);
 		return result;
@@ -102,7 +123,19 @@ export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentia
 		}
 		if (method === "tools/call") {
 			if (!upstream) return { content: [{ type: "text", text: `Hoja API unavailable: ${failure}` }], isError: true };
-			try { await connect(upstream.protocolVersion); return await upstream.send("tools/call", params, false, signal); }
+			try {
+				await connect(upstream.protocolVersion);
+				const result = await upstream.send("tools/call", params, false, signal);
+				if (sessionDir && !result?.isError) {
+					const activeSid = readActiveSession(sessionDir);
+					if (activeSid) {
+						const text = Array.isArray(result?.content) ? result.content.map((c: any) => c?.text ?? "").join("\n") : "";
+						const touched = extractTouchedIssuesFromTool(String(params?.name ?? ""), params?.arguments, text);
+						if (touched.length) appendTouchedIssues(sessionDir, activeSid, touched);
+					}
+				}
+				return result;
+			}
 			catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 		}
 		if (method === "ping") return {};
@@ -113,7 +146,7 @@ export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentia
 
 function main() {
 	const credentials = applyCredentials();
-	const proxy = createProxy(process.env, undefined, credentials);
+	const proxy = createProxy(process.env, undefined, credentials, dataDir());
 	const send = (m: Json) => process.stdout.write(JSON.stringify(m) + "\n");
 	const inflight = new Map<unknown, AbortController>();
 	createInterface({ input: process.stdin }).on("line", async line => {

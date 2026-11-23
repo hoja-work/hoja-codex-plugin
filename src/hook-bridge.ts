@@ -249,8 +249,9 @@ export class HookBridge {
 		return content ? context(hookEventName, content) : {};
 	}
 
-	private stop(payload: HookPayload): HookOutput {
+	private async stop(payload: HookPayload): Promise<HookOutput> {
 		if (this.subagent || process.env.PI_SWARM_SUBAGENT === "1") return {};
+		await this.shim.emit("turn_end");
 		const session = this.shim.sessionId || "session";
 		const messages: PiMessage[] = [...this.shim.transcript.messages()];
 		const last = messages.at(-1);

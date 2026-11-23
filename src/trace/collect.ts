@@ -8,12 +8,14 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { statSync } from "node:fs";
 import { FIELD_CAP } from "./redact.ts";
 import { buildTrace, type SubagentTranscript } from "./build.ts";
+import { traceDetail } from "../env.ts";
 import { hostOf } from "../host.ts";
 import { readHookRecords, tracePath, tracesDir } from "./recorder.ts";
 import { Redactor } from "./redact.ts";
+import { readTouchedIssues } from "./touched.ts";
 import type { HojaTrace, TraceTask } from "./schema.ts";
 
-export const PLUGIN_VERSION = "0.5.0";
+export const PLUGIN_VERSION = "0.5.3";
 const HOJA_TASK_ENTRY = "hoja-task-link";
 const TASK_STATE_ENTRY = "pi-swarm-task-state";
 
@@ -107,10 +109,14 @@ export function collectTrace(options: CollectOptions): HojaTrace {
 	try { if (transcriptPath) transcript = readFileSync(transcriptPath, "utf8"); } catch { /* hooks-only trace */ }
 	const journal = options.journal ?? [];
 	const links = hojaLinks(journal);
+	const extraIssues = [
+		...hooks.flatMap(h => h.touchedIssues ?? []),
+		...readTouchedIssues(options.dataDir, options.sessionId),
+	];
 	return buildTrace({
 		sessionId: options.sessionId, transcript, subagents: readSubagents(transcriptPath), hooks,
-		tasks: traceTasks(options.tasks ?? journalTasks(journal), links),
-		plugin: `hoja@${PLUGIN_VERSION}`, host: options.host ?? (hostOf() === "claude" ? undefined : hostOf()), detail: options.detail,
+		tasks: traceTasks(options.tasks ?? journalTasks(journal), links), extraIssues,
+		plugin: `hoja@${PLUGIN_VERSION}`, host: options.host ?? (hostOf() === "claude" ? undefined : hostOf()), detail: options.detail ?? traceDetail(options.env),
 		redactor: new Redactor(options.env ?? process.env), now: options.now, readPersisted: persistedReader(transcriptPath),
 	});
 }
