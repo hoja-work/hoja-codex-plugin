@@ -10,6 +10,7 @@ import { createRuntime } from "./runtime.ts";
 import { applyCredentials, dataDir, traceDetail } from "./env.ts";
 import { TraceRecorder } from "./trace/recorder.ts";
 import { TASK_COMPLETION_CONTRACT } from "./generated/contract.ts";
+import { updateNotice } from "./update-check.ts";
 
 export async function sessionContext(input: { session_id?: string; transcript_path?: string; cwd?: string }, env: NodeJS.ProcessEnv = process.env): Promise<string> {
 	const { shim } = createRuntime({ dataDir: dataDir(env), cwd: input.cwd || process.cwd(), hoja: !/^(1|true)$/i.test(env.HOJA_PLUGIN_DISABLE_HOJA ?? "") });
@@ -32,7 +33,9 @@ async function main() {
 	try { input = JSON.parse(readFileSync(0, "utf8") || "{}"); } catch { /* no stdin: still emit the static context */ }
 	// SessionStart at launch reaches no MCP server (mcp_tool hooks are skipped then), so it is recorded here.
 	new TraceRecorder({ dataDir: dataDir(), detail: traceDetail() }).record(input.session_id, "SessionStart", input);
-	const additionalContext = await sessionContext(input);
-	process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext } }));
+	// The update check runs alongside the context build; it is bounded (one cached request a day, 1.5 s timeout).
+	const [additionalContext, notice] = await Promise.all([sessionContext(input), updateNotice()]);
+	// `systemMessage` is shown to the user (Claude Code and Codex), never added to the model's context.
+	process.stdout.write(JSON.stringify({ ...(notice ? { systemMessage: notice } : {}), hookSpecificOutput: { hookEventName: "SessionStart", additionalContext } }));
 }
 if (process.argv[1] && /session-start\.(m?js|ts)$/.test(process.argv[1])) main().catch(error => { process.stderr.write(String(error?.stack ?? error)); process.exit(1); });

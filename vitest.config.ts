@@ -9,5 +9,7 @@ export default defineConfig({
     exclude: ["**/node_modules/**", "dist/**"],
     setupFiles: ["vendor/trebol/tests/setup/isolate-state.ts"],
     testTimeout: 30_000,
+    // No suite may reach GitHub: the update notice is off unless a test turns it on with a fake fetch.
+    env: { HOJA_PLUGIN_UPDATE_CHECK: "off" },
   },
 });
