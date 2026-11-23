@@ -86,6 +86,8 @@ export class HookBridge {
 	private readonly headless: boolean;
 	private readonly recorder?: TraceRecorder;
 	private readonly host: Host;
+	/** Antigravity: a PreToolUse answer cannot carry context, so a nudge waits for the next model call. */
+	private readonly deferred: string[] = [];
 	/** Codex: PreToolUse calls not yet settled by PostToolUse, so the turn flushes once per tool batch. */
 	private readonly inFlight = new Set<string>();
 
@@ -220,6 +222,7 @@ export class HookBridge {
 		}
 		this.inFlight.add(toolCallId ?? `anon-${this.inFlight.size}`);
 		// Pi prefixes pre-context onto the tool result; Claude Code delivers additionalContext alongside the result.
+		if (pre && this.host === "antigravity") { this.deferred.push(pre); return {}; }
 		return pre ? context("PreToolUse", pre) : {};
 	}
 
@@ -242,7 +245,7 @@ export class HookBridge {
 
 	private async turnEnd(hookEventName = "PostToolBatch"): Promise<HookOutput> {
 		await this.shim.emit("turn_end");
-		const content = this.pipeline.flushTurn();
+		const content = [...this.deferred.splice(0), this.pipeline.flushTurn()].filter(Boolean).join("\n\n");
 		return content ? context(hookEventName, content) : {};
 	}
 
@@ -258,7 +261,9 @@ export class HookBridge {
 		// Pi appends the continuation as a hidden custom message; Stop additionalContext continues the turn the same way
 		// (bounded by the vendored budget plus Claude Code's own continuation cap) without flagging a hook error.
 		if (decision.action === "continue" && decision.content)
-			return this.host === "codex" ? { decision: "block", reason: decision.content } : context("Stop", decision.content);
+			return this.host === "codex" ? { decision: "block", reason: decision.content }
+				: this.host === "antigravity" ? { decision: "continue", reason: decision.content }
+				: context("Stop", decision.content);
 		if (decision.action === "exhausted" && decision.content) return { systemMessage: decision.content };
 		return {};
 	}

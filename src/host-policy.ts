@@ -15,6 +15,8 @@
  * Anything not listed here keeps Trebol's decision unchanged; this is the only place the adapter widens the gate.
  */
 
+import { AGY_READ_ONLY } from "./agy.ts";
+
 /** `mcp__hoja__hoja_viewer` → `hojoviewer`; Trebol normalizes the same way (strip `_`, lowercase). */
 const bare = (name: string) => name.replace(/^mcp__[A-Za-z0-9_-]+__/, "");
 export const policyName = (name: string) => bare(name).replace(/_/g, "").toLowerCase();
@@ -41,6 +43,8 @@ export const READ_ONLY_HOST_TOOLS: readonly string[] = [
 	"hoja_inboxNotifications", "hoja_inboxUnreadCount",
 	// extension action catalogue (running one is hoja_extensionActionRun and stays gated)
 	"hoja_extensionActions",
+	// Antigravity built-ins that only read a terminal or a resource, or only talk to the user (agy.ts AGY_READ_ONLY)
+	...AGY_READ_ONLY,
 ];
 const READ_ONLY_HOST = new Set(READ_ONLY_HOST_TOOLS.map(policyName));
 

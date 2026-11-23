@@ -43,10 +43,62 @@ const textParts = (content: unknown): PiPart[] => {
 	return content.flatMap((block: any) => block?.type === "text" && typeof block.text === "string" ? [{ type: "text" as const, text: block.text }] : []);
 };
 
-/** Claude Code or Codex, decided by the file's own shape (Codex rollouts open with a `session_meta` line). */
+/** Claude Code, Codex or Antigravity, decided by the file's own shape. */
 export function parseTranscript(text: string): PiMessage[] {
 	const first = text.slice(0, text.indexOf("\n") === -1 ? text.length : text.indexOf("\n"));
-	return /"type"\s*:\s*"(session_meta|response_item|event_msg|turn_context)"/.test(first) ? parseCodexRollout(text) : parseClaudeTranscript(text);
+	if (/"type"\s*:\s*"(session_meta|response_item|event_msg|turn_context)"/.test(first)) return parseCodexRollout(text);
+	if (isAgyTranscriptLine(first)) return parseAgyTranscript(text);
+	return parseClaudeTranscript(text);
+}
+
+/** Antigravity: `{"step_index": 0, "type": "USER_INPUT", …}` (brain/<id>/.system_generated/logs/transcript_full.jsonl). */
+export const isAgyTranscriptLine = (line: string) => /"step_index"\s*:/.test(line) && /"type"\s*:\s*"(USER_INPUT|PLANNER_RESPONSE|GENERIC|SYSTEM_MESSAGE)"/.test(line);
+
+/** The user's own words inside an Antigravity USER_INPUT step (it wraps them in <USER_REQUEST>, plus metadata). */
+export const agyUserRequest = (content: string) => /<USER_REQUEST>\n?([\s\S]*?)\n?<\/USER_REQUEST>/.exec(content)?.[1] ?? content;
+/** A tool result step without its `Created At:` / `Completed At:` header lines. */
+export const agyResultText = (content: string) => content.replace(/^(?:(?:Created|Completed) At: [^\n]*\n)+/, "");
+/** Antigravity's own tool names → what Trebol records (agy.ts does the same for hook payloads). */
+export function agyToolName(call: { name?: string; args?: any }): string {
+	const name = String(call?.name ?? "tool");
+	if (name === "call_mcp_tool") return canonicalToolName(`mcp__${call.args?.ServerName ?? ""}__${call.args?.ToolName ?? ""}`);
+	const map: Record<string, string> = { run_command: "Bash", read_file: "Read", view_file: "Read", write_file: "Write", edit_file: "Edit", replace_file_content: "Edit", multi_replace_file_content: "MultiEdit", apply_patch: "Edit", list_dir: "LS", list_directory: "LS", grep_search: "Grep", find_by_name: "Glob", search_web: "WebSearch", read_url_content: "WebFetch", tool_search: "ToolSearch" };
+	return map[name] ?? name;
+}
+
+/**
+ * Antigravity transcript → Pi messages. A PLANNER_RESPONSE is one model message whose `tool_calls` (no ids) are
+ * answered, in order, by the GENERIC steps that follow it; ids are synthesized from the result's step index.
+ */
+export function parseAgyTranscript(text: string): PiMessage[] {
+	const out: PiMessage[] = [];
+	let pending: { id: string; name: string }[] = [];
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		let e: any;
+		try { e = JSON.parse(line); } catch { continue; }
+		if (e?.type === "USER_INPUT" && typeof e.content === "string") {
+			pending = [];
+			out.push({ role: "user", content: [{ type: "text", text: agyUserRequest(e.content) }] });
+		} else if (e?.type === "PLANNER_RESPONSE") {
+			const parts: PiPart[] = [];
+			if (typeof e.content === "string" && e.content) parts.push({ type: "text", text: e.content });
+			const calls = Array.isArray(e.tool_calls) ? e.tool_calls : [];
+			pending = calls.map((call: any, i: number) => ({ id: `agy-${e.step_index}-${i}`, name: agyToolName(call) }));
+			for (const p of pending) parts.push({ type: "toolCall", id: p.id, name: p.name });
+			out.push({ role: "assistant", content: parts, stopReason: calls.length ? "toolUse" : "stop" });
+		} else if (e?.type === "GENERIC" && pending.length) {
+			const call = pending.shift()!;
+			let body = agyResultText(typeof e.content === "string" ? e.content : "");
+			// agy words a hook denial "tool call denied by pre-tool hook: <reason>"; Trebol's gate-resume classifier
+			// (task-gate-resume.ts) recognizes Claude Code's "blocked by hook: <reason>", so the reason is re-worded.
+			const denied = typeof e.error === "string" ? /denied by (?:a )?pre-tool hook:\s*([\s\S]*)$/.exec(e.error) : null;
+			if (denied) body = `blocked by hook: ${denied[1]}`;
+			const exit = /Command exited with code (\d+)/.exec(body);
+			out.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content: body ? [{ type: "text", text: body }] : [], isError: e.status === "ERROR" || (!!exit && exit[1] !== "0") });
+		}
+	}
+	return out;
 }
 
 export const ROLLOUT_INJECTED = /^\s*<(environment_context|user_instructions|permissions instructions|skills_instructions|turn_aborted|subagent_notification)\b/;

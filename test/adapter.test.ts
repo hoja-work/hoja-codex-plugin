@@ -128,7 +128,24 @@ describe("prompt and packaging parity", () => {
 		expect(text).toContain(TASK_COMPLETION_CONTRACT);
 	});
 	it("hooks.json only forwards to the plugin's own bridge tool", () => {
-		// One test for both packagings: the Claude Code plugin (.claude-plugin) and the Codex plugin (.codex-plugin).
+		// One test for every packaging: Claude Code (.claude-plugin), Codex (.codex-plugin) and Antigravity (a root
+		// plugin.json beside mcp_config.json and hooks.json).
+		if (existsSync(join(root, "mcp_config.json"))) {
+			// Antigravity: one named hook ("hoja"), command hooks only, every event through dist/agy-hook.mjs; only the
+			// events agy 1.5.14 documents; PreToolUse/PostToolUse grouped by matcher, the others flat.
+			const named = JSON.parse(readFileSync(join(root, "hooks.json"), "utf8"));
+			expect(Object.keys(named)).toEqual(["hoja"]);
+			const events = Object.keys(named.hoja).filter(k => k !== "enabled");
+			expect(events.sort()).toEqual(["PostInvocation", "PostToolUse", "PreInvocation", "PreToolUse", "SessionStart", "Stop"]);
+			for (const event of events) {
+				const handlers = event.endsWith("ToolUse") ? named.hoja[event].flatMap((g: any) => { expect(g.matcher).toBe("*"); return g.hooks; }) : named.hoja[event];
+				for (const h of handlers) expect(h.command).toBe(`HOJA_PLUGIN_HOST=antigravity node ./dist/agy-hook.mjs ${event}`);
+			}
+			const servers = JSON.parse(readFileSync(join(root, "mcp_config.json"), "utf8")).mcpServers;
+			expect(Object.keys(servers).sort()).toEqual(["hoja", "hoja-api"]);
+			for (const server of Object.values<any>(servers)) expect(server.env.HOJA_PLUGIN_HOST).toBe("antigravity");
+			return;
+		}
 		const codex = existsSync(join(root, ".codex-plugin/plugin.json"));
 		const hooks = JSON.parse(readFileSync(join(root, "hooks/hooks.json"), "utf8")).hooks;
 		for (const [event, groups] of Object.entries<any[]>(hooks)) for (const g of groups) for (const h of g.hooks) {

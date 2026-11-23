@@ -13,7 +13,7 @@ import { readHookRecords, tracePath, tracesDir } from "./recorder.ts";
 import { Redactor } from "./redact.ts";
 import type { HojaTrace, TraceTask } from "./schema.ts";
 
-export const PLUGIN_VERSION = "0.4.1";
+export const PLUGIN_VERSION = "0.5.0";
 const HOJA_TASK_ENTRY = "hoja-task-link";
 const TASK_STATE_ENTRY = "pi-swarm-task-state";
 
@@ -110,7 +110,7 @@ export function collectTrace(options: CollectOptions): HojaTrace {
 	return buildTrace({
 		sessionId: options.sessionId, transcript, subagents: readSubagents(transcriptPath), hooks,
 		tasks: traceTasks(options.tasks ?? journalTasks(journal), links),
-		plugin: `hoja@${PLUGIN_VERSION}`, host: options.host ?? (hostOf() === "codex" ? "codex" : undefined), detail: options.detail,
+		plugin: `hoja@${PLUGIN_VERSION}`, host: options.host ?? (hostOf() === "claude" ? undefined : hostOf()), detail: options.detail,
 		redactor: new Redactor(options.env ?? process.env), now: options.now, readPersisted: persistedReader(transcriptPath),
 	});
 }
