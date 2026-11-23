@@ -9,7 +9,7 @@ import { appendFileSync } from "node:fs";
 import { hostOf } from "./host.ts";
 import { createInterface } from "node:readline";
 import { createRuntime } from "./runtime.ts";
-import { applyUserConfig, dataDir, enforcementMode, headless, truthy } from "./env.ts";
+import { applyCredentials, dataDir, enforcementMode, headless, truthy } from "./env.ts";
 
 export const HOOK_TOOL = "__hoja_hook";
 
@@ -21,7 +21,7 @@ const log = (line: string) => {
 	if (debugLog) try { appendFileSync(debugLog, `${new Date().toISOString()} ${line}\n`); } catch { /* best effort */ }
 };
 
-applyUserConfig();
+applyCredentials();
 let elicitation = false;
 let nextRequest = 0;
 const waiting = new Map<string, (result: any) => void>();

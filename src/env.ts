@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { Credentials } from "./credentials.ts";
 import type { EnforcementMode } from "../vendor/trebol/.pi/lib/runtime/swarm-builtin-hooks.ts";
 
 /** Plugin userConfig arrives as HOJA_PLUGIN_* (see .claude-plugin/plugin.json); empty means "not set". */
@@ -9,6 +10,12 @@ export function applyUserConfig(env: NodeJS.ProcessEnv = process.env) {
 	set("HOJA_PLUGIN_TOKEN", "HOJA_TOKEN");
 	set("HOJA_PLUGIN_PROJECT", "HOJA_PROJECT");
 	set("HOJA_PLUGIN_MCP_URL", "HOJA_MCP_URL");
+}
+/** The process's credential: userConfig first, then the environment, then the Hoja CLI's own sign-in. */
+export const credentials = new Credentials(process.env);
+export function applyCredentials(): Credentials {
+	applyUserConfig();
+	return credentials.apply();
 }
 /**
  * Where task journals live; the MCP server and the SessionStart hook must agree. Claude Code gives both

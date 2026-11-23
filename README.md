@@ -40,8 +40,13 @@ codex plugin add hoja@hoja
 
 Then three one-time steps:
 
-1. **Credentials (optional).** Export them in the shell that starts Codex. The plugin forwards only the variables
-   listed in [Configuration](#configuration).
+1. **Sign in (optional).** Sign in once with the Hoja CLI; the plugin asks it for a current token and the
+   workspace's endpoints (`hoja auth token --json`) and refreshes on expiry:
+   ```bash
+   hoja auth login acme.hoja.work
+   ```
+   For automation, export credentials in the shell that starts Codex instead; a configured token wins over the CLI
+   sign-in. The plugin forwards only the variables listed in [Configuration](#configuration).
    ```bash
    export HOJA_API_URL=https://hoja.example.com/graphql HOJA_TOKEN=… HOJA_PROJECT="My Project"
    ```

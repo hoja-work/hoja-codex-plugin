@@ -10,7 +10,8 @@
  */
 import { createInterface } from "node:readline";
 import { HOJA_ENDPOINT_HINT, MISSING_HOJA_TOKEN, resolveHojaToken, resolveHojaUrl } from "../vendor/trebol/.pi/lib/claw/hoja.ts";
-import { applyUserConfig } from "./env.ts";
+import { applyCredentials } from "./env.ts";
+import { authFetch, normalizeEndpoint, SIGN_IN_HINT, type Credentials } from "./credentials.ts";
 
 type Json = Record<string, any>;
 type Env = Record<string, string | undefined>;
@@ -18,7 +19,7 @@ type Env = Record<string, string | undefined>;
 /** HOJA_MCP_URL, else the GraphQL endpoint's host with path /mcp (the inverse of resolveHojaUrl's MCP→GraphQL rule). */
 export function resolveMcpUrl(env: Env = process.env): string {
 	const direct = env.HOJA_MCP_URL?.trim();
-	if (direct) return direct;
+	if (direct) return normalizeEndpoint(direct).url;
 	const graphql = resolveHojaUrl(env);
 	if (!graphql) return "";
 	try { const u = new URL(graphql); u.pathname = "/mcp"; u.search = ""; u.hash = ""; return u.toString(); } catch { return ""; }
@@ -45,7 +46,7 @@ export class UpstreamMcp {
 		if (session) this.session = session;
 		const text = await response.text();
 		if (notification) return undefined;
-		if (response.status === 401 || response.status === 403) throw new Error(`Hoja MCP rejected the token (${response.status}). Check HOJA_TOKEN.`);
+		if (response.status === 401 || response.status === 403) throw new Error(`Hoja MCP rejected the token (${response.status}). ${SIGN_IN_HINT}`);
 		if (response.status >= 400) throw new Error(`Hoja MCP ${this.url} answered HTTP ${response.status}`);
 		const message = parseMessages(text, response.headers.get("content-type") ?? "").find(m => m.id === id);
 		if (!message) throw new Error(`Hoja MCP returned no response for ${method}`);
@@ -64,11 +65,13 @@ export function parseMessages(body: string, contentType: string): Json[] {
 	return out;
 }
 
-export function createProxy(env: Env = process.env, fetchImpl?: Fetch) {
+export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentials?: Credentials) {
 	const url = resolveMcpUrl(env);
-	const token = resolveHojaToken(env);
-	const problem = !url ? HOJA_ENDPOINT_HINT : !token ? MISSING_HOJA_TOKEN : "";
-	const upstream = problem ? undefined : new UpstreamMcp(url, token, fetchImpl);
+	const token = credentials ? credentials.token() : resolveHojaToken(env);
+	const configProblem = credentials?.problems.join(" ") ?? "";
+	const problem = configProblem || (!url ? HOJA_ENDPOINT_HINT : !token ? `${MISSING_HOJA_TOKEN}. ${SIGN_IN_HINT}` : "");
+	const transport = credentials ? authFetch(credentials, (fetchImpl ?? fetch) as any) as Fetch : fetchImpl;
+	const upstream = problem ? undefined : new UpstreamMcp(url, token, transport);
 	let ready: Promise<Json> | undefined;
 	let failure = problem;
 	const connect = (protocolVersion: string) => ready ??= (async () => {
@@ -109,8 +112,8 @@ export function createProxy(env: Env = process.env, fetchImpl?: Fetch) {
 }
 
 function main() {
-	applyUserConfig();
-	const proxy = createProxy();
+	const credentials = applyCredentials();
+	const proxy = createProxy(process.env, undefined, credentials);
 	const send = (m: Json) => process.stdout.write(JSON.stringify(m) + "\n");
 	const inflight = new Map<unknown, AbortController>();
 	createInterface({ input: process.stdin }).on("line", async line => {

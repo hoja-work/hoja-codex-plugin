@@ -34,6 +34,116 @@ function credentialValue(names, env = process.env) {
   return void 0;
 }
 
+// src/credentials.ts
+import { execFileSync } from "node:child_process";
+var URL_VARS = ["HOJA_API_URL", "LINEAR_API_URL", "HOJA_MCP_URL"];
+var TOKEN_VARS = ["HOJA_TOKEN", "LINEAR_TOKEN"];
+var LOOPBACK = /* @__PURE__ */ new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+function normalizeEndpoint(raw) {
+  const value = raw?.trim() ?? "";
+  if (!value) return { url: "" };
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return { url: "", problem: `"${value}" is not a URL. Use the full address, e.g. https://acme.hoja.work/mcp.` };
+  }
+  if (parsed.protocol === "http:" && !LOOPBACK.has(parsed.hostname)) {
+    return { url: "", problem: `Refusing plain-http endpoint ${parsed.host}: Hoja tokens are only sent over https (loopback excepted).` };
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return { url: "", problem: `Unsupported scheme in "${value}".` };
+  return { url: parsed.toString() };
+}
+var defaultRunCli = (args) => execFileSync("hoja", args, {
+  encoding: "utf8",
+  timeout: 15e3,
+  stdio: ["ignore", "pipe", "ignore"],
+  windowsHide: true
+});
+function readCliCredential(run = defaultRunCli) {
+  try {
+    const parsed = JSON.parse(run(["auth", "token", "--json"]));
+    return typeof parsed?.access_token === "string" && parsed.access_token ? parsed : void 0;
+  } catch {
+    return void 0;
+  }
+}
+var Credentials = class {
+  constructor(env = process.env, run = defaultRunCli) {
+    this.env = env;
+    this.run = run;
+  }
+  env;
+  run;
+  source = "none";
+  problems = [];
+  workspace;
+  expiresAt = 0;
+  apply() {
+    this.problems = [];
+    for (const name of URL_VARS) {
+      if (!this.env[name]?.trim()) continue;
+      const { url, problem } = normalizeEndpoint(this.env[name]);
+      if (problem) {
+        this.problems.push(`${name}: ${problem}`);
+        delete this.env[name];
+      } else this.env[name] = url;
+    }
+    if (TOKEN_VARS.some((name) => this.env[name]?.trim())) {
+      this.source = "env";
+      return this;
+    }
+    this.fromCli();
+    return this;
+  }
+  /** The token to send now; refreshes a CLI token that is about to expire. */
+  token() {
+    if (this.source === "hoja-cli" && this.expiresAt && Date.now() > this.expiresAt - 6e4) this.fromCli();
+    return this.env.HOJA_TOKEN?.trim() || this.env.LINEAR_TOKEN?.trim() || "";
+  }
+  /** After a 401: a pasted key cannot be refreshed; a CLI sign-in can. True when a new token was obtained. */
+  refresh() {
+    if (this.source !== "hoja-cli") return false;
+    const before = this.env.HOJA_TOKEN;
+    this.fromCli();
+    return this.source === "hoja-cli" && this.env.HOJA_TOKEN !== before;
+  }
+  fromCli() {
+    const credential = readCliCredential(this.run);
+    if (!credential) {
+      if (this.source === "hoja-cli") delete this.env.HOJA_TOKEN;
+      this.source = "none";
+      return;
+    }
+    this.source = "hoja-cli";
+    this.env.HOJA_TOKEN = credential.access_token;
+    this.workspace = credential.workspace?.name || credential.workspace?.origin;
+    const expires = typeof credential.expires_at === "number" ? credential.expires_at * 1e3 : Date.parse(credential.expires_at ?? "");
+    this.expiresAt = Number.isFinite(expires) ? expires : 0;
+    for (const [name, value] of [["HOJA_API_URL", credential.api_url], ["HOJA_MCP_URL", credential.mcp_url]]) {
+      if (this.env[name]?.trim() || !value) continue;
+      const { url } = normalizeEndpoint(value);
+      if (url) this.env[name] = url;
+    }
+  }
+};
+function authFetch(credentials2, base = fetch) {
+  const withToken = (init) => {
+    const headers = { ...init?.headers ?? {} };
+    for (const key of Object.keys(headers)) if (key.toLowerCase() === "authorization") delete headers[key];
+    const token = credentials2.token();
+    if (token) headers.authorization = `Bearer ${token}`;
+    return { ...init, headers };
+  };
+  return async (url, init) => {
+    const response = await base(url, withToken(init));
+    if (response?.status !== 401 || !credentials2.refresh()) return response;
+    return base(url, withToken(init));
+  };
+}
+var SIGN_IN_HINT = "Run `hoja auth login <your-workspace>` in a terminal (recommended), or set HOJA_TOKEN and HOJA_API_URL.";
+
 // src/env.ts
 function applyUserConfig(env = process.env) {
   const set = (from, to) => {
@@ -45,11 +155,16 @@ function applyUserConfig(env = process.env) {
   set("HOJA_PLUGIN_PROJECT", "HOJA_PROJECT");
   set("HOJA_PLUGIN_MCP_URL", "HOJA_MCP_URL");
 }
+var credentials = new Credentials(process.env);
+function applyCredentials() {
+  applyUserConfig();
+  return credentials.apply();
+}
 
 // src/api-proxy.ts
 function resolveMcpUrl(env = process.env) {
   const direct = env.HOJA_MCP_URL?.trim();
-  if (direct) return direct;
+  if (direct) return normalizeEndpoint(direct).url;
   const graphql = resolveHojaUrl(env);
   if (!graphql) return "";
   try {
@@ -88,7 +203,7 @@ var UpstreamMcp = class {
     if (session) this.session = session;
     const text = await response.text();
     if (notification) return void 0;
-    if (response.status === 401 || response.status === 403) throw new Error(`Hoja MCP rejected the token (${response.status}). Check HOJA_TOKEN.`);
+    if (response.status === 401 || response.status === 403) throw new Error(`Hoja MCP rejected the token (${response.status}). ${SIGN_IN_HINT}`);
     if (response.status >= 400) throw new Error(`Hoja MCP ${this.url} answered HTTP ${response.status}`);
     const message = parseMessages(text, response.headers.get("content-type") ?? "").find((m) => m.id === id);
     if (!message) throw new Error(`Hoja MCP returned no response for ${method}`);
@@ -115,11 +230,13 @@ function parseMessages(body, contentType) {
   }
   return out;
 }
-function createProxy(env = process.env, fetchImpl) {
+function createProxy(env = process.env, fetchImpl, credentials2) {
   const url = resolveMcpUrl(env);
-  const token = resolveHojaToken(env);
-  const problem = !url ? HOJA_ENDPOINT_HINT : !token ? MISSING_HOJA_TOKEN : "";
-  const upstream = problem ? void 0 : new UpstreamMcp(url, token, fetchImpl);
+  const token = credentials2 ? credentials2.token() : resolveHojaToken(env);
+  const configProblem = credentials2?.problems.join(" ") ?? "";
+  const problem = configProblem || (!url ? HOJA_ENDPOINT_HINT : !token ? `${MISSING_HOJA_TOKEN}. ${SIGN_IN_HINT}` : "");
+  const transport = credentials2 ? authFetch(credentials2, fetchImpl ?? fetch) : fetchImpl;
+  const upstream = problem ? void 0 : new UpstreamMcp(url, token, transport);
   let ready;
   let failure = problem;
   const connect = (protocolVersion) => ready ??= (async () => {
@@ -177,8 +294,8 @@ function createProxy(env = process.env, fetchImpl) {
   return { handle, url, problem: () => failure };
 }
 function main() {
-  applyUserConfig();
-  const proxy = createProxy();
+  const credentials2 = applyCredentials();
+  const proxy = createProxy(process.env, void 0, credentials2);
   const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
   const inflight = /* @__PURE__ */ new Map();
   createInterface({ input: process.stdin }).on("line", async (line) => {
