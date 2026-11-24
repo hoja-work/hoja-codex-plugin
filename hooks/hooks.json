@@ -115,7 +115,7 @@
               "stop_hook_active": "${stop_hook_active}",
               "last_assistant_message": "${last_assistant_message}"
             },
-            "timeout": 20
+            "timeout": 150
           }
         ]
       }

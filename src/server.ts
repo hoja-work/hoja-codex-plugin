@@ -12,6 +12,8 @@ import { createRuntime } from "./runtime.ts";
 import { listen, socketPath } from "./agy-socket.ts";
 import { transcriptFromArtifacts } from "./agy.ts";
 import { PLUGIN_VERSION } from "./trace/collect.ts";
+import { DecisionDelivery } from "./decision-wait.ts";
+import { decisionApi } from "./decision-waiter.ts";
 import { applyCredentials, dataDir, enforcementMode, headless, traceDetail, traceUpload, truthy } from "./env.ts";
 
 export const HOOK_TOOL = "__hoja_hook";
@@ -48,6 +50,7 @@ const runtime = createRuntime({
 	enforcementMode: enforcementMode(), headless: headless(), autogenSkills: truthy(process.env.HOJA_AUTOGEN_SKILLS),
 	hoja: !truthy(process.env.HOJA_PLUGIN_DISABLE_HOJA),
 	trace: { upload: traceUpload(), detail: traceDetail() },
+	decisions: new DecisionDelivery({ dataDir: dataDir(), api: () => decisionApi(), log }),
 });
 if (debugLog) log(`start host=${hostOf()} dataDir=${dataDir()} enforcement=${enforcementMode()} headless=${headless()}`);
 const { shim, bridge } = runtime;

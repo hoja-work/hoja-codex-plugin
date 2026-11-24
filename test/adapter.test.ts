@@ -151,7 +151,9 @@ describe("prompt and packaging parity", () => {
 		for (const [event, groups] of Object.entries<any[]>(hooks)) for (const g of groups) for (const h of g.hooks) {
 			if (h.type === "mcp_tool") { expect(h.server).toBe(codex ? "hoja" : "plugin:hoja:hoja"); expect(h.tool).toBe("__hoja_hook"); expect(h.input.event).toBe(event); }
 			else if (codex) expect(h.command).toBe(`HOJA_PLUGIN_HOST=codex node "$PLUGIN_ROOT/dist/${event === "SessionEnd" ? "trace-hook" : "session-start"}.mjs"`);
-			// Command hooks: SessionStart (no MCP client exists at launch) and SessionEnd (the server may be gone).
+			// Command hooks: SessionStart (no MCP client exists at launch) and SessionEnd (the server may be gone), plus
+			// Stop's background decision waiter (asyncRewake wakes an idle session with a decision's answer, HOJA-799).
+			else if (event === "Stop") { expect(h.args[0]).toBe("${CLAUDE_PLUGIN_ROOT}/dist/decision-wait.mjs"); expect(h.asyncRewake).toBe(true); }
 			else expect(h.args[0]).toBe(event === "SessionEnd" ? "${CLAUDE_PLUGIN_ROOT}/dist/trace-hook.mjs" : "${CLAUDE_PLUGIN_ROOT}/dist/session-start.mjs");
 		}
 		if (codex) {

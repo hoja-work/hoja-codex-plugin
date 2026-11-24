@@ -37,7 +37,8 @@ export async function handleAgyHook(event: string, payload: Record<string, any>,
 	if (!socket) { debug(`${event}: no hoja server socket found; failing open`); return failOpen(event); }
 	const { event: bridgeEvent, payload: bridgePayload } = agyToBridge(event, payload);
 	try {
-		const out = await request(socket, { event: bridgeEvent, payload: bridgePayload });
+		// Stop may hold for a bound decision's answer (decision-wait.ts, 120 s); hooks.json gives Stop 150 s.
+		const out = await request(socket, { event: bridgeEvent, payload: bridgePayload }, bridgeEvent === "Stop" ? 145_000 : undefined);
 		if (out?.error) { debug(`${event}: server error ${out.error}`); return failOpen(event); }
 		return bridgeToAgy(event, out, event === "PreToolUse" ? { tool_name: bridgePayload.tool_name, tool_input: bridgePayload.tool_input } : undefined);
 	} catch (error) {

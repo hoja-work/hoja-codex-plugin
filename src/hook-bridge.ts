@@ -34,6 +34,7 @@ import { canonicalToolName, isOwnTool, type PiMessage } from "./transcript.ts";
 import { bashReadOnlyCommand, isAdapterReadOnlyTool, localCommandOf, normalizeCommandName } from "./host-policy.ts";
 import { hostOf, type Host } from "./host.ts";
 import type { PiShim } from "./pi-shim.ts";
+import type { DecisionDelivery } from "./decision-wait.ts";
 import type { TraceRecorder } from "./trace/recorder.ts";
 
 export interface BridgeOptions {
@@ -47,6 +48,8 @@ export interface BridgeOptions {
 	host?: Host;
 	/** Session tracing: every hook event, with the bridge's own answer, is handed to the recorder. */
 	recorder?: TraceRecorder;
+	/** Bound Hoja decisions: hold the Stop for an answer, inject one that arrived while idle, ack (HOJA-799). */
+	decisions?: DecisionDelivery;
 }
 
 export type HookPayload = Record<string, any>;
@@ -90,6 +93,7 @@ export class HookBridge {
 	private readonly headless: boolean;
 	private readonly recorder?: TraceRecorder;
 	private readonly host: Host;
+	private readonly decisions?: DecisionDelivery;
 	/** Antigravity: a PreToolUse answer cannot carry context, so a nudge waits for the next model call. */
 	private readonly deferred: string[] = [];
 	/** Codex: PreToolUse calls not yet settled by PostToolUse, so the turn flushes once per tool batch. */
@@ -109,6 +113,7 @@ export class HookBridge {
 		const mode = options.enforcementMode ?? "block";
 		this.headless = options.headless ?? false;
 		this.recorder = options.recorder;
+		this.decisions = options.decisions;
 		this.host = options.host ?? hostOf();
 		// Without the autogenskills extension Trebol never installs this source, and the vendored fallback counter
 		// ("only supports standalone pipeline tests") would block every 5th call until a Skill runs. A source that never
@@ -151,6 +156,10 @@ export class HookBridge {
 		// A host leaves a placeholder unexpanded (or null) when the event lacks that field; that means "absent".
 		const payload = Object.fromEntries(Object.entries(input).filter(([, v]) => v != null && !(typeof v === "string" && /^\$\{[\w.]+\}$/.test(v))));
 		await this.bind(payload);
+		if (this.decisions && !this.subagent) {
+			try { await this.decisions.observe(this.shim.sessionId || undefined, payload); }
+			catch { /* delivery bookkeeping never breaks a hook */ }
+		}
 		const output = await this.dispatch(event, payload);
 		if (this.recorder) {
 			const text = event === "PostToolUse" ? responseText(payload.tool_response) : event === "PostToolUseFailure" ? responseText(payload.error ?? payload.tool_response) : undefined;
@@ -204,7 +213,10 @@ export class HookBridge {
 		if (this.host !== "antigravity") (this.pipeline as any).pendingToolMessages = [];
 		const { injected } = this.pipeline.onUserPrompt({ messageAfterReceive: this.headless, prompt });
 		const line = this.registration.onUserPrompt(prompt, this.tasks());
+		// A decision answered while the session sat idle (Codex/agy have no idle wake-up) arrives with the next prompt.
+		const answer = await this.decisions?.atPrompt(this.shim.sessionId || undefined).catch(() => undefined);
 		const text = [injected, line].filter(Boolean).join("\n");
+		if (answer) return context("UserPromptSubmit", [text && formatHookContext("user_prompt_submit", text), answer].filter(Boolean).join("\n\n"));
 		return text ? context("UserPromptSubmit", formatHookContext("user_prompt_submit", text)) : {};
 	}
 
@@ -282,7 +294,11 @@ export class HookBridge {
 		// Not a gate stop: before the turn ends, the work it did must be registered and its task reconciled. Once per
 		// turn (the policy remembers), so a continuation can never loop.
 		const reminder = this.registration.onSettle(this.tasks());
-		if (!reminder) return {};
+		if (!reminder) {
+			// A bound decision is open: hold the stop for its answer and continue this same turn with it (stage 2).
+			const answer = await this.decisions?.atStop(this.shim.sessionId || undefined).catch(() => undefined);
+			return answer ? this.blockStop(answer) : {};
+		}
 		this.recorder?.record(this.shim.sessionId, "WorkRegistration", { hook: WORK_REGISTRATION_HOOK, reminder });
 		return this.continueTurn(reminder);
 	}
@@ -292,6 +308,11 @@ export class HookBridge {
 		return this.host === "codex" ? { decision: "block", reason: content }
 			: this.host === "antigravity" ? { decision: "continue", reason: content }
 			: context("Stop", content);
+	}
+
+	/** Continue the turn with a decision's answer as the next input: Claude Code and Codex `decision:block`. */
+	private blockStop(reason: string): HookOutput {
+		return this.host === "antigravity" ? { decision: "continue", reason } : { decision: "block", reason };
 	}
 
 	private async command(payload: HookPayload): Promise<HookOutput> {

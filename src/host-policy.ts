@@ -40,6 +40,8 @@ export const READ_ONLY_HOST_TOOLS: readonly string[] = [
 	"hoja_issueLabels", "hoja_taskLabels",
 	// decisions (read) and inbox
 	"hoja_issueDecisions", "hoja_issueDecision", "hoja_taskDecisions", "hoja_taskDecision",
+	// waiting for a decision's answer only reads (decision-wait.ts)
+	"hoja_decisionWait",
 	"hoja_inboxNotifications", "hoja_inboxUnreadCount",
 	// extension action catalogue (running one is hoja_extensionActionRun and stays gated)
 	"hoja_extensionActions",
