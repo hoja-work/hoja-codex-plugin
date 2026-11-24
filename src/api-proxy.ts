@@ -14,6 +14,7 @@ import { applyCredentials, dataDir } from "./env.ts";
 import { authFetch, normalizeEndpoint, SIGN_IN_HINT, type Credentials } from "./credentials.ts";
 import { hostOf } from "./host.ts";
 import { appendTouchedIssues, extractTouchedIssuesFromTool, readActiveSession } from "./trace/touched.ts";
+import { ARTIFACT_UPLOAD_TOOL, originOf, rewriteLocalMedia, runArtifactUpload, writesUserText, type ArtifactClient, type HttpFetch } from "./artifacts.ts";
 
 type Json = Record<string, any>;
 type Env = Record<string, string | undefined>;
@@ -78,7 +79,7 @@ export function parseMessages(body: string, contentType: string): Json[] {
 	return out;
 }
 
-export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentials?: Credentials, pluginDataDir?: string) {
+export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentials?: Credentials, pluginDataDir?: string, storageFetch?: HttpFetch) {
 	const url = resolveMcpUrl(env);
 	const token = credentials ? credentials.token() : resolveHojaToken(env);
 	const configProblem = credentials?.problems.join(" ") ?? "";
@@ -95,6 +96,11 @@ export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentia
 	const upstream = problem ? undefined : new UpstreamMcp(url, token, transport, headerProvider);
 	let ready: Promise<Json> | undefined;
 	let failure = problem;
+	// Hoja's REST upload routes share the MCP transport's auth; the presigned storage PUT carries its own signature.
+	const hojaFetch: HttpFetch = credentials
+		? authFetch(credentials, (fetchImpl ?? fetch) as any, headerProvider) as any
+		: (u, init) => ((fetchImpl ?? fetch) as any)(u, { ...init, headers: { ...init.headers, authorization: `Bearer ${token}`, ...headerProvider() } });
+	const artifacts: ArtifactClient = { origin: originOf(url), hojaFetch, plainFetch: (storageFetch ?? fetch) as any, cwd: env.CLAUDE_PROJECT_DIR || process.cwd() };
 	const connect = (protocolVersion: string) => ready ??= (async () => {
 		upstream!.protocolVersion = protocolVersion;
 		const result = await upstream!.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: `hoja-${host}-plugin`, version: "0.2.0" } });
@@ -118,14 +124,26 @@ export function createProxy(env: Env = process.env, fetchImpl?: Fetch, credentia
 				const tools: Json[] = [];
 				let cursor: string | undefined;
 				do { const page = await upstream.send("tools/list", cursor ? { cursor } : {}, false, signal); tools.push(...(page?.tools ?? [])); cursor = page?.nextCursor; } while (cursor);
-				return { tools };
+				return { tools: [ARTIFACT_UPLOAD_TOOL, ...tools] };
 			} catch { return { tools: [] }; }
 		}
 		if (method === "tools/call") {
 			if (!upstream) return { content: [{ type: "text", text: `Hoja API unavailable: ${failure}` }], isError: true };
 			try {
 				await connect(upstream.protocolVersion);
+				const name = String(params?.name ?? "");
+				if (name === ARTIFACT_UPLOAD_TOOL.name) return await runArtifactUpload(artifacts, params?.arguments ?? {});
+				let notes: string[] = [];
+				if (writesUserText(name) && params?.arguments) {
+					const rewritten = await rewriteLocalMedia(artifacts, params.arguments);
+					params = { ...params, arguments: rewritten.args };
+					notes = [
+						...rewritten.uploaded.map(u => `Uploaded ${u.path} → ${u.absoluteUrl} (the local path was replaced with this link).`),
+						...rewritten.errors.map(e => `Could not upload a referenced file: ${e}. Use hoja_artifactUpload, never a local path.`),
+					];
+				}
 				const result = await upstream.send("tools/call", params, false, signal);
+				if (notes.length && Array.isArray(result?.content)) result.content = [...result.content, { type: "text", text: notes.join("\n") }];
 				if (sessionDir && !result?.isError) {
 					const activeSid = readActiveSession(sessionDir);
 					if (activeSid) {
