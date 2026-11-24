@@ -47,7 +47,7 @@ describe("hosted Hoja API proxy", () => {
 		recordActiveSession(dataDir, "sess-proxy-1", process.ppid);
 		const proxy = createProxy({ HOJA_API_URL: "https://x.hoja.work/graphql", HOJA_TOKEN: "tok", HOJA_PLUGIN_DATA: dataDir }, fakeHoja(calls));
 		expect((await proxy.handle("initialize", { protocolVersion: "2025-06-18" })).instructions).toBe("Hoja is a work tracker");
-		expect((await proxy.handle("tools/list", {})).tools.map((t: any) => t.name)).toEqual(["hoja_issues", "hoja_commentCreate"]);
+		expect((await proxy.handle("tools/list", {})).tools.map((t: any) => t.name)).toEqual(["hoja_artifactUpload", "hoja_issues", "hoja_commentCreate"]);
 		expect(await proxy.handle("tools/call", { name: "hoja_issues", arguments: {} })).toEqual({ content: [{ type: "text", text: "called hoja_issues" }] });
 		expect(readTouchedIssues(dataDir, "sess-proxy-1")).toEqual([]);
 		await proxy.handle("tools/call", { name: "hoja_commentCreate", arguments: { issueId: "HOJA-77", body: "hi" } });

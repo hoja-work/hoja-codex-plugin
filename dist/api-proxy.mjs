@@ -361,6 +361,143 @@ function appendTouchedIssues(dataDir2, sessionId, issues) {
   }
 }
 
+// src/artifacts.ts
+import { existsSync as existsSync2, readFileSync as readFileSync2, statSync } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { basename, isAbsolute, resolve as resolve2 } from "node:path";
+var MEDIA_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "pdf"];
+var MEDIA_RE = new RegExp(
+  String.raw`(?<![\w/:.~-])(?:file://)?(?:~/|/|\./|\.\./)?(?:[\w@%+=,.-]+/)*[\w@%+=,.-]+\.(?:${MEDIA_EXTENSIONS.join("|")})(?![\w/])`,
+  "gi"
+);
+function originOf(graphqlUrl) {
+  try {
+    return new URL(graphqlUrl).origin;
+  } catch {
+    return "";
+  }
+}
+function resolveLocalPath(raw, cwd = process.cwd()) {
+  let p = raw.startsWith("file://") ? decodeURIComponent(raw.slice("file://".length)) : raw;
+  if (p.startsWith("~/")) p = homedir2() + p.slice(1);
+  return isAbsolute(p) ? p : resolve2(cwd, p);
+}
+async function json(res, what) {
+  const text = await res.text();
+  let body = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+  }
+  if (res.status >= 400) throw new Error(`${what} failed (HTTP ${res.status}): ${body.error ?? text.slice(0, 200)}`);
+  return body;
+}
+async function uploadFile(client, rawPath, opts = {}) {
+  const path = resolveLocalPath(rawPath, client.cwd);
+  if (!existsSync2(path) || !statSync(path).isFile()) throw new Error(`${rawPath}: no such file`);
+  const bytes = readFileSync2(path);
+  const filename = basename(path);
+  const begin = await json(await client.hojaFetch(`${client.origin}/api/uploads/direct`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ filename, size: bytes.length, ...opts.ttlDays ? { ttlDays: opts.ttlDays } : {} })
+  }), `upload ${filename}`);
+  const put = begin.put ?? {};
+  const sender = put.auth ? client.hojaFetch : client.plainFetch;
+  const sent = await sender(put.url, { method: "PUT", headers: { ...put.headers ?? {} }, body: bytes });
+  if (sent.status >= 300) throw new Error(`upload ${filename}: storage refused the bytes (HTTP ${sent.status})`);
+  const title = opts.title?.trim() || filename;
+  const done = await json(await client.hojaFetch(begin.completeUrl ?? `${client.origin}/api/uploads/${begin.id}/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(opts.issue ? { issueId: opts.issue, title } : {})
+  }), `complete ${filename}`);
+  const absoluteUrl = done.absoluteUrl ?? `${client.origin}${done.url}`;
+  const contentType = String(done.contentType ?? begin.contentType ?? "");
+  const markdown = contentType.startsWith("image/") ? `![${title}](${absoluteUrl})` : `[${title}](${absoluteUrl})`;
+  return { path, url: done.url, absoluteUrl, contentType, size: Number(done.size ?? bytes.length), title, markdown, attachmentId: done.attachment?.id };
+}
+var ARTIFACT_UPLOAD_TOOL = {
+  name: "hoja_artifactUpload",
+  description: "Upload local files (screenshots, screen recordings, PDFs, any artifact you produced) to Hoja and optionally attach them to a task. Pass paths (absolute or relative to the project). Bytes go straight to Hoja storage (up to 512 MB each, no base64). Returns each file's shareable URL and Markdown to paste into comments, descriptions or decision options (mediaUrl). Never put a local path (/tmp/..., /root/..., file://) in a task: it only opens on this machine. For many variants (e.g. 15 design options), upload them all here, then ask with hoja_taskDecisionCreate using each URL as an option's mediaUrl.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 50, description: "Local file paths to upload." },
+      issueId: { type: "string", description: "Task identifier (e.g. HOJA-123) to attach each file to." },
+      titles: { type: "array", items: { type: "string" }, description: "Optional titles, same order as paths." },
+      ttlDays: { type: "integer", minimum: 1, maximum: 365, description: "Delete the files after this many days." }
+    },
+    required: ["paths"]
+  }
+};
+async function runArtifactUpload(client, args) {
+  const paths = Array.isArray(args?.paths) ? args.paths.map(String) : typeof args?.path === "string" ? [args.path] : [];
+  if (!paths.length) return { content: [{ type: "text", text: 'hoja_artifactUpload: pass paths: ["/path/to/file.png"]' }], isError: true };
+  const results = [];
+  const errors = [];
+  for (const [i, p] of paths.entries()) {
+    try {
+      const up = await uploadFile(client, p, { issue: args.issueId, title: args.titles?.[i], ttlDays: args.ttlDays });
+      results.push({ path: p, url: up.url, absoluteUrl: up.absoluteUrl, contentType: up.contentType, size: up.size, markdown: up.markdown, ...up.attachmentId ? { attachmentId: up.attachmentId } : {} });
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  const text = JSON.stringify({ uploaded: results, ...errors.length ? { errors } : {} }, null, 1);
+  return { content: [{ type: "text", text }], ...results.length ? {} : { isError: true } };
+}
+function writesUserText(tool) {
+  return /^hoja_(?:issue|task)(?:Create|Update|ReviewRequest|DecisionCreate)$|^hoja_comment(?:Create|Update)$|^hoja_projectUpdateCreate$|^hoja_knowledgeDoc(?:Create|Update)$/.test(tool);
+}
+function issueOf(args) {
+  const v = args?.issueId ?? args?.input?.issueId ?? args?.id;
+  return typeof v === "string" && /^[A-Za-z][A-Za-z0-9]*-\d+/.test(v) ? v : void 0;
+}
+async function rewriteLocalMedia(client, args) {
+  const cache = /* @__PURE__ */ new Map();
+  const uploaded = [];
+  const errors = [];
+  const issue = issueOf(args);
+  const rewrite = async (text) => {
+    const matches = [...text.matchAll(MEDIA_RE)].map((m) => m[0]);
+    if (!matches.length) return text;
+    let out = text;
+    for (const raw of new Set(matches)) {
+      const path = resolveLocalPath(raw, client.cwd);
+      if (!cache.has(path)) {
+        let up2 = null;
+        if (existsSync2(path) && statSync(path).isFile()) {
+          try {
+            up2 = await uploadFile(client, raw, { issue });
+            uploaded.push(up2);
+          } catch (error) {
+            errors.push(error.message);
+          }
+        }
+        cache.set(path, up2);
+      }
+      const up = cache.get(path);
+      if (!up) continue;
+      if (text.trim() === raw) return up.absoluteUrl;
+      out = out.split(`](${raw})`).join(`](${up.absoluteUrl})`);
+      out = out.replace(new RegExp(`(?<![\\w/:.~(-])${raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w/])`, "g"), up.markdown);
+    }
+    return out;
+  };
+  const walk = async (value) => {
+    if (typeof value === "string") return rewrite(value);
+    if (Array.isArray(value)) return Promise.all(value.map(walk));
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = await walk(v);
+      return out;
+    }
+    return value;
+  };
+  return { args: await walk(args), uploaded, errors };
+}
+
 // src/api-proxy.ts
 function resolveMcpUrl(env = process.env) {
   const direct = env.HOJA_MCP_URL?.trim();
@@ -438,7 +575,7 @@ function parseMessages(body, contentType) {
   }
   return out;
 }
-function createProxy(env = process.env, fetchImpl, credentials2, pluginDataDir) {
+function createProxy(env = process.env, fetchImpl, credentials2, pluginDataDir, storageFetch) {
   const url = resolveMcpUrl(env);
   const token = credentials2 ? credentials2.token() : resolveHojaToken(env);
   const configProblem = credentials2?.problems.join(" ") ?? "";
@@ -455,6 +592,8 @@ function createProxy(env = process.env, fetchImpl, credentials2, pluginDataDir) 
   const upstream = problem ? void 0 : new UpstreamMcp(url, token, transport, headerProvider);
   let ready;
   let failure = problem;
+  const hojaFetch = credentials2 ? authFetch(credentials2, fetchImpl ?? fetch, headerProvider) : (u, init) => (fetchImpl ?? fetch)(u, { ...init, headers: { ...init.headers, authorization: `Bearer ${token}`, ...headerProvider() } });
+  const artifacts = { origin: originOf(url), hojaFetch, plainFetch: storageFetch ?? fetch, cwd: env.CLAUDE_PROJECT_DIR || process.cwd() };
   const connect = (protocolVersion) => ready ??= (async () => {
     upstream.protocolVersion = protocolVersion;
     const result = await upstream.send("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: `hoja-${host}-plugin`, version: "0.2.0" } });
@@ -490,7 +629,7 @@ function createProxy(env = process.env, fetchImpl, credentials2, pluginDataDir) 
           tools.push(...page?.tools ?? []);
           cursor = page?.nextCursor;
         } while (cursor);
-        return { tools };
+        return { tools: [ARTIFACT_UPLOAD_TOOL, ...tools] };
       } catch {
         return { tools: [] };
       }
@@ -499,7 +638,19 @@ function createProxy(env = process.env, fetchImpl, credentials2, pluginDataDir) 
       if (!upstream) return { content: [{ type: "text", text: `Hoja API unavailable: ${failure}` }], isError: true };
       try {
         await connect(upstream.protocolVersion);
+        const name = String(params?.name ?? "");
+        if (name === ARTIFACT_UPLOAD_TOOL.name) return await runArtifactUpload(artifacts, params?.arguments ?? {});
+        let notes = [];
+        if (writesUserText(name) && params?.arguments) {
+          const rewritten = await rewriteLocalMedia(artifacts, params.arguments);
+          params = { ...params, arguments: rewritten.args };
+          notes = [
+            ...rewritten.uploaded.map((u) => `Uploaded ${u.path} \u2192 ${u.absoluteUrl} (the local path was replaced with this link).`),
+            ...rewritten.errors.map((e) => `Could not upload a referenced file: ${e}. Use hoja_artifactUpload, never a local path.`)
+          ];
+        }
         const result = await upstream.send("tools/call", params, false, signal);
+        if (notes.length && Array.isArray(result?.content)) result.content = [...result.content, { type: "text", text: notes.join("\n") }];
         if (sessionDir && !result?.isError) {
           const activeSid = readActiveSession(sessionDir);
           if (activeSid) {
