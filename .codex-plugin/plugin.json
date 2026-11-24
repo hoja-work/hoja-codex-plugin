@@ -1,6 +1,6 @@
 {
   "name": "hoja",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Trebol's TaskManage (acceptance questions + evidence-validated completion), its Swarm task-enforcement hooks, Hoja mode (automatic TaskManage → Hoja issue publication) and session traces attached to the issue the work belongs to, plus the hosted Hoja API tools — ported 1:1 to Codex.",
   "author": {
     "name": "Hoja",

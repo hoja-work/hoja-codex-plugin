@@ -107,7 +107,7 @@ describe("artifact uploads", () => {
 			return reply({ content: [{ type: "text", text: "ok" }] });
 		};
 		const proxy = createProxy({ HOJA_API_URL: "https://acme.hoja.work/graphql", HOJA_TOKEN: "tok" }, fetchImpl, undefined, undefined, dep.client.plainFetch as any);
-		expect((await proxy.handle("tools/list", {})).tools.map((t: any) => t.name)).toEqual(["hoja_artifactUpload", "hoja_commentCreate"]);
+		expect((await proxy.handle("tools/list", {})).tools.map((t: any) => t.name)).toEqual(["hoja_artifactUpload", "hoja_decisionWait", "hoja_commentCreate"]);
 		const res = await proxy.handle("tools/call", { name: "hoja_commentCreate", arguments: { issueId: "HOJA-4", body: `see ${shot}` } });
 		const forwarded = sent.find(b => b.method === "tools/call");
 		expect(forwarded.params.arguments.body).toBe("see ![shot.png](https://acme.hoja.work/api/uploads/blob1.png)");
