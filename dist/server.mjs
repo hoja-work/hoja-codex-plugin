@@ -6252,6 +6252,24 @@ function applyUserConfig(env = process.env) {
   set("HOJA_PLUGIN_TOKEN", "HOJA_TOKEN");
   set("HOJA_PLUGIN_PROJECT", "HOJA_PROJECT");
   set("HOJA_PLUGIN_MCP_URL", "HOJA_MCP_URL");
+  applyRunCredential(env);
+}
+var RUN_CREDENTIAL_ENV = [
+  ["HOJA_RUN_API_TOKEN", "HOJA_TOKEN"],
+  ["HOJA_RUN_API_URL", "HOJA_API_URL"],
+  ["HOJA_RUN_MCP_URL", "HOJA_MCP_URL"]
+];
+function applyRunCredential(env = process.env) {
+  if (!env.HOJA_RUN_API_TOKEN?.trim()) return false;
+  for (const [from, to] of RUN_CREDENTIAL_ENV) {
+    const v = env[from]?.trim();
+    if (v) env[to] = v;
+    else delete env[to];
+  }
+  for (const name of ["HOJA_PLUGIN_TOKEN", "HOJA_PLUGIN_API_URL", "HOJA_PLUGIN_MCP_URL", "LINEAR_TOKEN", "LINEAR_API_URL"]) {
+    delete env[name];
+  }
+  return true;
 }
 var credentials = new Credentials(process.env);
 function applyCredentials() {

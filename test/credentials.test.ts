@@ -97,3 +97,35 @@ describe("proxy with CLI credentials", () => {
 		expect((await proxy.handle("initialize", { protocolVersion: "2025-06-18" })).instructions).toMatch(/hoja auth login/);
 	});
 });
+
+describe("a Hoja run's own credential (HOJA-921)", () => {
+	it("beats a saved userConfig token, the environment and the CLI sign-in on a shared machine", async () => {
+		const { applyUserConfig } = await import("../src/env.ts");
+		const env: Record<string, string | undefined> = {
+			// Another person's setup on the same machine: userConfig (both spellings), env, and a CLI sign-in.
+			HOJA_PLUGIN_TOKEN: "clover-userconfig", CLAUDE_PLUGIN_OPTION_HOJA_TOKEN: "clover-option",
+			HOJA_PLUGIN_API_URL: "https://clover.hoja.work", HOJA_PLUGIN_MCP_URL: "https://clover.hoja.work/mcp",
+			HOJA_TOKEN: "clover-env", LINEAR_TOKEN: "clover-linear", HOJA_PLUGIN_PROJECT: "Kept",
+			// What the runner sets for this run.
+			HOJA_RUN_API_TOKEN: "run-key", HOJA_RUN_API_URL: "https://hoja.hoja.work", HOJA_RUN_MCP_URL: "https://hoja.hoja.work/mcp",
+		};
+		applyUserConfig(env as any);
+		const run = cli(new Error("must not run"));
+		const credentials = new Credentials(env, run).apply();
+		expect(credentials.source).toBe("env");
+		expect(credentials.token()).toBe("run-key");
+		expect(run.calls).toBe(0);
+		expect(env).toMatchObject({ HOJA_API_URL: "https://hoja.hoja.work/", HOJA_MCP_URL: "https://hoja.hoja.work/mcp", HOJA_PROJECT: "Kept" });
+		expect(env.LINEAR_TOKEN).toBeUndefined();
+		expect(env.HOJA_PLUGIN_TOKEN).toBeUndefined();
+		// A second pass (another hook in the same process) changes nothing.
+		applyUserConfig(env as any);
+		expect(new Credentials(env, run).apply().token()).toBe("run-key");
+	});
+	it("without a run credential, userConfig keeps working as before", async () => {
+		const { applyUserConfig } = await import("../src/env.ts");
+		const env: Record<string, string | undefined> = { HOJA_PLUGIN_TOKEN: "mine", HOJA_TOKEN: "env" };
+		applyUserConfig(env as any);
+		expect(env.HOJA_TOKEN).toBe("mine");
+	});
+});
