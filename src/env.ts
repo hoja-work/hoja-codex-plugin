@@ -21,6 +21,28 @@ export function applyUserConfig(env: NodeJS.ProcessEnv = process.env) {
 	set("HOJA_PLUGIN_TOKEN", "HOJA_TOKEN");
 	set("HOJA_PLUGIN_PROJECT", "HOJA_PROJECT");
 	set("HOJA_PLUGIN_MCP_URL", "HOJA_MCP_URL");
+	applyRunCredential(env);
+}
+/**
+ * HOJA-921: a Hoja agent run's own credential, set by the runner (HOJA_RUN_API_TOKEN, HOJA_RUN_API_URL,
+ * HOJA_RUN_MCP_URL). It beats everything else on the machine: a token saved in this plugin's userConfig, a
+ * HOJA_TOKEN/LINEAR_TOKEN in the environment, and the Hoja CLI's sign-in. On a machine shared by several people
+ * any of those may belong to another workspace, and a run must file its work in the workspace that launched it.
+ * Returns whether a run credential was applied.
+ */
+export const RUN_CREDENTIAL_ENV: [string, string][] = [
+	["HOJA_RUN_API_TOKEN", "HOJA_TOKEN"], ["HOJA_RUN_API_URL", "HOJA_API_URL"], ["HOJA_RUN_MCP_URL", "HOJA_MCP_URL"],
+];
+export function applyRunCredential(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (!env.HOJA_RUN_API_TOKEN?.trim()) return false;
+	for (const [from, to] of RUN_CREDENTIAL_ENV) {
+		const v = env[from]?.trim();
+		if (v) env[to] = v; else delete env[to];
+	}
+	for (const name of ["HOJA_PLUGIN_TOKEN", "HOJA_PLUGIN_API_URL", "HOJA_PLUGIN_MCP_URL", "LINEAR_TOKEN", "LINEAR_API_URL"]) {
+		delete env[name];
+	}
+	return true;
 }
 /** The process's credential: userConfig first, then the environment, then the Hoja CLI's own sign-in. */
 export const credentials = new Credentials(process.env);
